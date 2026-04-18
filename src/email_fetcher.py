@@ -101,4 +101,252 @@ class EmailFetcher:
             return result[0]  # Format: "2024-01-15T10:30:00Z"
         return None
 
-    # ... (le reste de votre code existant : fetch_all_emails, search_emails, etc.)
+    def _log_sync(self, fetched, updated):
+        """Enregistre une synchronisation dans le log"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO sync_log (emails_fetched, emails_updated, last_email_date)
+            VALUES (?, ?, ?)
+        """, (fetched, updated, datetime.now().isoformat()))
+
+        conn.commit()
+        conn.close()
+
+    def fetch_all_emails(self, incremental=True, max_emails=None):
+        """
+        Récupère les emails depuis Microsoft Graph
+
+        Args:
+            incremental (bool): Si True, ne récupère que les nouveaux emails depuis la dernière synchronisation
+            max_emails (int): Limite le nombre d'emails à récupérer (None = pas de limite)
+
+        Returns:
+            int: Nombre total d'emails récupérés
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Initialisation des compteurs
+        total_fetched = 0
+        total_updated = 0
+        page = 1
+        next_link = None
+
+        # Construction de l'URL de l'API Graph
+        url = f"{self.graph_base}/me/mailFolders/inbox/messages"
+        params = {
+            "$top": "100",  # Nombre d'emails par page
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,sender,bodyPreview,receivedDateTime,isRead,hasAttachments",
+            "$expand": "to,cc"  # Pour récupérer les destinataires
+        }
+
+        # Ajout du filtre pour la synchronisation incrémentale
+        if incremental:
+            last_sync = self.get_last_sync_time()
+            if last_sync:
+                # Format ISO 8601 pour Microsoft Graph
+                params["$filter"] = f"receivedDateTime gt {last_sync}"
+
+        while True:
+            try:
+                # Construction de l'URL complète
+                if next_link:
+                    url = next_link
+                else:
+                    # Ajout des paramètres à l'URL
+                    param_str = "&".join([f"{k}={v}" for k, v in params.items()])
+                    url = f"{self.graph_base}/me/mailFolders/inbox/messages?{param_str}"
+
+                print(f"🔍 Récupération de la page {page}...")
+                response = requests.get(url, headers=self.headers)
+                response.raise_for_status()
+                data = response.json()
+
+                # Traitement des emails
+                emails = data.get("value", [])
+                if not emails:
+                    print("✅ Aucune nouvelle page d'emails")
+                    break
+
+                for email in emails:
+                    # Vérification si l'email existe déjà
+                    cursor.execute("""
+                        SELECT id FROM emails
+                        WHERE id = ? AND user_email = ?
+                    """, (email["id"], self.user_email))
+                    existing = cursor.fetchone()
+
+                    # Préparation des données
+                    recipients = {
+                        "to": [{"email": t["emailAddress"]["address"], "name": t["emailAddress"]["name"]}
+                              for t in email.get("toRecipients", [])],
+                        "cc": [{"email": t["emailAddress"]["address"], "name": t["emailAddress"]["name"]}
+                              for t in email.get("ccRecipients", [])]
+                    }
+
+                    # Insertion ou mise à jour
+                    if existing:
+                        # Mise à jour de l'email existant
+                        cursor.execute("""
+                            UPDATE emails SET
+                                subject = ?,
+                                sender = ?,
+                                sender_email = ?,
+                                recipients = ?,
+                                date = ?,
+                                body_preview = ?,
+                                is_read = ?,
+                                has_attachments = ?,
+                                last_synced = CURRENT_TIMESTAMP
+                            WHERE id = ? AND user_email = ?
+                        """, (
+                            email["subject"],
+                            email["sender"]["emailAddress"]["name"],
+                            email["sender"]["emailAddress"]["address"],
+                            json.dumps(recipients),
+                            email["receivedDateTime"],
+                            email["bodyPreview"],
+                            1 if email.get("isRead", False) else 0,
+                            1 if email.get("hasAttachments", False) else 0,
+                            email["id"],
+                            self.user_email
+                        ))
+                        total_updated += 1
+                    else:
+                        # Insertion du nouvel email
+                        cursor.execute("""
+                            INSERT INTO emails (
+                                id, subject, sender, sender_email, recipients,
+                                date, body_preview, is_read, has_attachments, user_email
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            email["id"],
+                            email["subject"],
+                            email["sender"]["emailAddress"]["name"],
+                            email["sender"]["emailAddress"]["address"],
+                            json.dumps(recipients),
+                            email["receivedDateTime"],
+                            email["bodyPreview"],
+                            1 if email.get("isRead", False) else 0,
+                            1 if email.get("hasAttachments", False) else 0,
+                            self.user_email
+                        ))
+                        total_fetched += 1
+
+                # Gestion de la pagination
+                next_link = data.get("@odata.nextLink")
+                if not next_link or (max_emails and total_fetched + total_updated >= max_emails):
+                    print(f"✅ Dernière page atteinte (total: {total_fetched + total_updated})")
+                    break
+
+                page += 1
+                print(f"✅ Page {page} traitée. Total: {total_fetched + total_updated}")
+
+            except Exception as e:
+                print(f"❌ Erreur lors de la récupération des emails: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+
+        conn.commit()
+        conn.close()
+
+        # Log de la synchronisation
+        self._log_sync(total_fetched, total_updated)
+
+        print(f"🎉 {total_fetched} nouveaux emails, {total_updated} mis à jour")
+        return total_fetched + total_updated
+
+    def search_emails(self, search_term, limit=10):
+        """Recherche d'emails par sujet ou contenu"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, subject, sender, sender_email, date, body_preview
+            FROM emails
+            WHERE user_email = ?
+            AND (subject LIKE ? OR body_preview LIKE ?)
+            ORDER BY date DESC
+            LIMIT ?
+        """, (self.user_email, f"%{search_term}%", f"%{search_term}%", limit))
+
+        results = cursor.fetchall()
+        conn.close()
+
+        return [{
+            "id": row[0],
+            "subject": row[1],
+            "sender": row[2],
+            "sender_email": row[3],
+            "date": row[4],
+            "body_preview": row[5]
+        } for row in results]
+
+    def get_email_body(self, email_id):
+        """Récupère le corps complet d'un email"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT subject, sender, sender_email, date, body, recipients
+            FROM emails
+            WHERE id = ? AND user_email = ?
+        """, (email_id, self.user_email))
+
+        result = cursor.fetchone()
+        conn.close()
+
+        if result:
+            return {
+                "subject": result[0],
+                "sender": result[1],
+                "sender_email": result[2],
+                "date": result[3],
+                "body": result[4],
+                "recipients": json.loads(result[5]) if result[5] else []
+            }
+        return None
+
+    def get_stats(self):
+        """Récupère les statistiques des emails"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Total d'emails
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ?",
+                       (self.user_email,))
+        total_emails = cursor.fetchone()[0]
+
+        # Emails non lus
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ? AND is_read = 0",
+                       (self.user_email,))
+        unread_emails = cursor.fetchone()[0]
+
+        # Emails avec pièces jointes
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ? AND has_attachments = 1",
+                       (self.user_email,))
+        emails_with_attachments = cursor.fetchone()[0]
+
+        # Dernière synchro
+        cursor.execute("""
+            SELECT sync_time, emails_fetched, emails_updated
+            FROM sync_log
+            ORDER BY sync_time DESC
+            LIMIT 1
+        """)
+        sync_info = cursor.fetchone()
+
+        conn.close()
+
+        return {
+            "total_emails": total_emails,
+            "unread_emails": unread_emails,
+            "emails_with_attachments": emails_with_attachments,
+            "last_sync_time": sync_info[0] if sync_info else None,
+            "last_sync_fetched": sync_info[1] if sync_info else None,
+            "last_sync_updated": sync_info[2] if sync_info else None
+        }
