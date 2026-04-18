@@ -5,8 +5,10 @@ import config
 
 class SearchEngine:
 
-    def __init__(self):
-        self.ix = index.open_dir(config.INDEX_PATH)
+    def __init__(self, db_path=None, index_path=None):
+        self.db_path = db_path or config.DB_PATH
+        self.index_path = index_path or config.INDEX_PATH
+        self.ix = index.open_dir(self.index_path)
 
     def search(self, query_str, fields=None, limit=50):
         if not fields:
@@ -19,7 +21,7 @@ class SearchEngine:
             scores  = {r["id"]: r.score for r in results}
 
         # Récupérer les destinataires depuis SQLite
-        conn = sqlite3.connect(config.DB_PATH)
+        conn = sqlite3.connect(self.db_path)  # ✅ Utilise self.db_path
         cursor = conn.cursor()
         result_list = []
         for email_id in ids:
@@ -43,7 +45,7 @@ class SearchEngine:
         return result_list
 
     def get_email_detail(self, email_id):
-        conn   = sqlite3.connect(config.DB_PATH)
+        conn   = sqlite3.connect(self.db_path)  # ✅ Utilise self.db_path
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM emails WHERE id=?", (email_id,))
         row = cursor.fetchone()
