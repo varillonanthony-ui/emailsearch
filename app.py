@@ -111,7 +111,7 @@ def get_sync_stats(user_db):
         """)
         result = cursor.fetchone()
         conn.close()
-        
+
         if result:
             return {
                 "sync_time": result[0],
@@ -273,14 +273,14 @@ with st.sidebar:
         "🔧 Debug"
     ])
     st.markdown("---")
-    
+
     # ── STATS EN SIDEBAR ──────────────────────────────────────
     try:
         conn  = sqlite3.connect(user_db)
         count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
         conn.close()
         st.metric("📧 Emails indexés", f"{count:,}")
-        
+
         # Affiche la dernière synchro
         sync_stats = get_sync_stats(user_db)
         if sync_stats:
@@ -316,26 +316,21 @@ if menu == "🔍 Recherche":
             sender_filter = st.text_input("Expéditeur")
 
         if query:
-    try:
-        from src.search_engine import SearchEngine
-        engine   = SearchEngine(db_path=user_db)  # ✅ Correct
-        keywords = [kw.strip() for kw in query.split() if kw.strip()]
+            try:
+                from src.search_engine import SearchEngine
+                engine   = SearchEngine(db_path=user_db, index_path=user_index)  # ✅ CORRIGÉ : ajout de index_path
+                keywords = [kw.strip() for kw in query.split() if kw.strip()]
 
-        all_sets        = []
-        all_results_map = {}
-        for keyword in keywords:
-            res = engine.search(keyword)  # ❌ Enlève le paramètre 'fields=search_in'
-            all_sets.append(set(r['id'] for r in res))
-            for r in res:
-                all_results_map[r['id']] = r
+                all_sets        = []
+                all_results_map = {}
+                for keyword in keywords:
+                    res = engine.search(keyword)  # ✅ CORRIGÉ : suppression de fields=search_in
+                    all_sets.append(set(r['id'] for r in res))
+                    for r in res:
+                        all_results_map[r['id']] = r
 
-        common_ids = all_sets[0].intersection(*all_sets[1:]) if all_sets else set()
-        results    = [all_results_map[i] for i in common_ids]
-
-    except Exception as e:
-        st.error(f"❌ Erreur : {e}")
-        import traceback
-        st.error(traceback.format_exc())
+                common_ids = all_sets[0].intersection(*all_sets[1:]) if all_sets else set()
+                results    = [all_results_map[i] for i in common_ids]
 
                 if sender_filter:
                     results = [r for r in results if
@@ -372,7 +367,9 @@ if menu == "🔍 Recherche":
                             st.markdown(detail['body'], unsafe_allow_html=True)
 
             except Exception as e:
-                st.error(f"Erreur : {e}")
+                st.error(f"❌ Erreur : {e}")
+                import traceback
+                st.error(traceback.format_exc())
                 st.info("💡 Lancez d'abord une synchronisation !")
 
     # ── RECHERCHE LIVE API ────────────────────────────────────
@@ -406,7 +403,7 @@ if menu == "🔍 Recherche":
                     st.session_state.live_total_api    = len(emails)
                     st.session_state.live_expanded      = {}   # reset les corps ouverts
                 except Exception as e:
-                    st.error(f"Erreur : {e}")
+                    st.error(f"❌ Erreur : {e}")
                     st.session_state.live_results = None
 
         elif search_btn:
@@ -507,7 +504,9 @@ elif menu == "📊 Statistiques":
             st.plotly_chart(fig2, use_container_width=True)
 
     except Exception as e:
-        st.error(f"Erreur : {e}")
+        st.error(f"❌ Erreur : {e}")
+        import traceback
+        st.error(traceback.format_exc())
 
 # ── PAGE SYNCHRONISATION ──────────────────────────────────────
 elif menu == "🔄 Synchronisation":
@@ -523,10 +522,10 @@ elif menu == "🔄 Synchronisation":
         st.markdown("---")
 
     col1, col2 = st.columns([3, 1])
-    
+
     with col1:
         st.info("✅ La synchronisation est **incrémentale** — elle récupère uniquement les nouveaux emails depuis la dernière synchro.")
-    
+
     with col2:
         full_sync = st.checkbox("🔄 Forcer une synchro complète", value=False, 
                                 help="⚠️ Réanalyser TOUS les emails (lent)")
@@ -540,7 +539,7 @@ elif menu == "🔄 Synchronisation":
             with st.spinner("📥 Récupération des emails..."):
                 fetcher = EmailFetcher(token=token, db_path=user_db, user_email=user_mail)
                 total_fetched = fetcher.fetch_all_emails(incremental=not full_sync)
-                
+
                 if total_fetched > 0:
                     st.success(f"✅ {total_fetched} emails récupérés !")
                 else:
@@ -554,7 +553,7 @@ elif menu == "🔄 Synchronisation":
                     st.success(f"✅ {total_indexed} emails indexés !")
 
                 st.balloons()
-            
+
             # ✅ Afficher les stats mises à jour
             st.markdown("---")
             st.subheader("📊 Résumé de la synchronisation")
@@ -589,24 +588,26 @@ elif menu == "🔧 Debug":
 
         except Exception as e:
             st.error(f"❌ Exception : {e}")
-    
+
     st.markdown("---")
     st.subheader("🗄️ Infos Base de données")
     try:
         conn = sqlite3.connect(user_db)
         cursor = conn.cursor()
-        
+
         cursor.execute("SELECT COUNT(*) FROM emails")
         email_count = cursor.fetchone()[0]
-        
+
         cursor.execute("SELECT COUNT(*) FROM sync_log")
         sync_count = cursor.fetchone()[0]
-        
+
         conn.close()
-        
+
         col1, col2 = st.columns(2)
         col1.metric("📧 Emails en base", email_count)
         col2.metric("📅 Synchronisations", sync_count)
-        
+
     except Exception as e:
-        st.error(f"Erreur : {e}")
+        st.error(f"❌ Erreur : {e}")
+        import traceback
+        st.error(traceback.format_exc())
