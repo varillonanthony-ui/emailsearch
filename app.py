@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import sqlite3
+import json
 import sys, os
 
 sys.path.append(os.path.dirname(__file__))
@@ -112,7 +113,19 @@ if menu == "🔍 Recherche":
                     f"📧 {email['subject']} | 👤 {email['sender']} | 📅 {email['date'][:10]}"
                 ):
                     st.markdown(f"**De :** {email['sender']} ({email['sender_email']})")
-                    st.markdown(f"**À :** {email.get('to', 'N/A')}")  # ← AJOUT
+
+                    # ── Affichage destinataires ────────────
+                    to_raw = email.get('to', '')
+                    try:
+                        to_list = json.loads(to_raw)
+                        to_display = ", ".join(
+                            f"{r['emailAddress']['name']} <{r['emailAddress']['address']}>"
+                            for r in to_list
+                        )
+                    except:
+                        to_display = to_raw or "N/A"
+                    st.markdown(f"**À :** {to_display}")
+
                     st.markdown(f"**Date :** {email['date']}")
                     st.markdown(f"**Aperçu :** {email['body_preview']}")
                     st.markdown(f"**Score :** {email['score']:.2f}")
