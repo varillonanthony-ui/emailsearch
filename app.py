@@ -144,12 +144,41 @@ FOLDER_OPTIONS = {
 }
 
 def search_emails_api(token, query, folder_key):
-    select = "$select=subject,from,receivedDateTime,bodyPreview,isRead,toRecipients"
+    # On demande aussi le body pour filtrer dedans
+    select = "$select=subject,from,receivedDateTime,bodyPreview,isRead,toRecipients,body"
     if folder_key == "all":
         endpoint = f"/me/messages?$search=\"{query}\"&$top=999&{select}"
     else:
         endpoint = f"/me/mailFolders/{folder_key}/messages?$search=\"{query}\"&$top=999&{select}"
     return graph_get_all_pages(token, endpoint)
+
+def highlight_keywords(text, keywords):
+    """Surligne les mots-clés en orange dans un texte markdown."""
+    for kw in keywords:
+        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+        text = pattern.sub(lambda m: f"**:orange[{m.group(0)}]**", text)
+    return text
+
+def highlight_keywords_html(text, keywords):
+    """Surligne les mots-clés dans du HTML."""
+    for kw in keywords:
+        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+        text = pattern.sub(
+            lambda m: f"<mark style='background:orange;color:black'>{m.group(0)}</mark>",
+            text
+        )
+    return text
+
+def email_matches(email, keywords):
+    """Vérifie que TOUS les mots-clés sont présents dans l'email."""
+    subject  = (email.get("subject") or "").lower()
+    preview  = (email.get("bodyPreview") or "").lower()
+    body_raw = email.get("body", {})
+    body     = (body_raw.get("content") if isinstance(body_raw, dict) else "").lower()
+    sender   = (email.get("from", {}).get("emailAddress", {}).get("name") or "").lower()
+    sender  += (email.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+    full_text = f"{subject} {preview} {body} {sender}"
+    return all(kw in full_text for kw in keywords)
 
 # ── VÉRIFICATION TOKEN ────────────────────────────────────────
 cfg = get_auth_config()
@@ -285,15 +314,29 @@ if menu == "🔍 Recherche":
             search_btn = st.button("Rechercher", type="primary", use_container_width=True)
 
         if search_btn and live_query:
-            folder_key = FOLDER_OPTIONS[folder_label]
+            folder_key    = FOLDER_OPTIONS[folder_label]
+            keywords_list = [kw.strip().lower() for kw in live_query.split() if kw.strip()]
+
             with st.spinner(f"Recherche dans « {folder_label} »..."):
                 try:
                     emails = search_emails_api(token, live_query, folder_key)
-                    if not emails:
-                        st.info("Aucun email trouvé.")
+
+                    # ── FILTRE CLIENT ─────────────────────────────────
+                    filtered = [e for e in emails if email_matches(e, keywords_list)]
+
+                    if not filtered:
+                        st.info("Aucun email ne contient vraiment ce mot-clé.")
+                        st.caption(f"(L'API avait retourné {len(emails)} résultats, tous écartés)")
                     else:
-                        st.success(f"✅ {len(emails)} email(s) trouvé(s) dans {folder_label}")
-                        for email in emails:
+                        st.success(f"✅ {len(filtered)} email(s) trouvé(s) dans {folder_label}")
+                        if len(filtered) < len(emails):
+                            st.caption(
+                                f"ℹ️ {len(emails) - len(filtered)} email(s) écartés car "
+                                f"le mot-clé n'y apparaissait pas réellement."
+                            )
+                        st.markdown("---")
+
+                        for email in filtered:
                             subject     = email.get("subject", "(sans objet)")
                             sender      = email.get("from", {}).get("emailAddress", {})
                             sender_name = sender.get("name", "")
@@ -303,16 +346,32 @@ if menu == "🔍 Recherche":
                             is_read     = email.get("isRead", True)
                             unread      = "🔵 " if not is_read else ""
                             to_list     = email.get("toRecipients", [])
-                            to_str      = ", ".join([r.get("emailAddress", {}).get("address", "") for r in to_list])
+                            to_str      = ", ".join([
+                                r.get("emailAddress", {}).get("address", "")
+                                for r in to_list
+                            ])
+
+                            # Surligner le mot-clé dans le preview
+                            preview_hl = highlight_keywords(preview, keywords_list)
 
                             with st.expander(f"{unread}📧 **{subject}** — {sender_name} ({date})"):
                                 st.markdown(f"**De :** {sender_name} <{sender_addr}>")
                                 if to_str:
                                     st.markdown(f"**À :** {to_str}")
                                 st.markdown(f"**Date :** {date}")
-                                st.markdown(f"**Aperçu :** {preview}")
+                                st.markdown(f"**Aperçu :** {preview_hl}")
+
+                                # Bouton pour voir le body complet
+                                if st.button("Voir email complet", key=f"live_{email.get('id', '')}"):
+                                    body_raw     = email.get("body", {})
+                                    body_content = body_raw.get("content", "") if isinstance(body_raw, dict) else ""
+                                    body_hl      = highlight_keywords_html(body_content, keywords_list)
+                                    st.markdown("---")
+                                    st.markdown(body_hl, unsafe_allow_html=True)
+
                 except Exception as e:
                     st.error(f"Erreur : {e}")
+
         elif search_btn:
             st.warning("Entrez un mot-clé.")
 
@@ -362,8 +421,8 @@ elif menu == "🔄 Synchronisation":
             from src.indexer import EmailIndexer
 
             with st.spinner("📥 Récupération des emails (sans limite)..."):
-                fetcher = EmailFetcher(token=token)        # passe le token device flow
-                total   = fetcher.fetch_all_emails()       # plus de max_emails
+                fetcher = EmailFetcher(token=token)
+                total   = fetcher.fetch_all_emails()
                 st.success(f"✅ {total} emails récupérés !")
 
             with st.spinner("🔍 Indexation en cours..."):
