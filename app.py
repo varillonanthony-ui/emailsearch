@@ -5,6 +5,7 @@ import sqlite3
 import json
 import requests, re, time, datetime, msal
 import sys, os
+import hashlib
 
 sys.path.append(os.path.dirname(__file__))
 import config
@@ -20,6 +21,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # ── SESSION STATE ─────────────────────────────────────────────
 for k, v in [("token", None), ("device_flow", None), ("msal_app", None),
              ("msal_cache", None), ("token_cache", None),
+             ("user_id", None), ("user_mail", None),
              ("live_expanded", {}), ("live_results", None), ("live_query_done", "")]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -74,6 +76,23 @@ def complete_device_flow():
         return result["access_token"]
     return None
 
+# ── FONCTION POUR OBTENIR L'ID UTILISATEUR ───────────────────
+def get_user_info(token):
+    """Récupère l'ID et l'email unique de l'utilisateur"""
+    try:
+        me = graph_get(token, "/me")
+        user_id = me.get("id")
+        user_mail = me.get("mail") or me.get("userPrincipalName")
+        return user_id, user_mail
+    except:
+        return None, None
+
+def get_user_db_path(user_mail):
+    """Génère un chemin de DB unique par utilisateur"""
+    user_hash = hashlib.md5(user_mail.encode()).hexdigest()[:8]
+    base_dir = os.path.dirname(config.DB_PATH)
+    return os.path.join(base_dir, f"emails_{user_hash}.db")
+
 # ── PAGE LOGIN ────────────────────────────────────────────────
 def page_login(cfg):
     st.title("📧 Email Search")
@@ -84,8 +103,12 @@ def page_login(cfg):
 
         token = try_silent_auth(cfg)
         if token:
-            st.session_state.token = token
-            st.rerun()
+            user_id, user_mail = get_user_info(token)
+            if user_id and user_mail:
+                st.session_state.token = token
+                st.session_state.user_id = user_id
+                st.session_state.user_mail = user_mail
+                st.rerun()
 
         if not st.session_state.device_flow:
             if st.button("Se connecter avec Office 365", use_container_width=True, type="primary"):
@@ -106,9 +129,15 @@ def page_login(cfg):
                 with st.spinner("Vérification..."):
                     token = complete_device_flow()
                 if token:
-                    st.session_state.token = token
-                    st.session_state.device_flow = None
-                    st.rerun()
+                    user_id, user_mail = get_user_info(token)
+                    if user_id and user_mail:
+                        st.session_state.token = token
+                        st.session_state.user_id = user_id
+                        st.session_state.user_mail = user_mail
+                        st.session_state.device_flow = None
+                        st.rerun()
+                    else:
+                        st.error("Impossible de récupérer les infos utilisateur.")
                 else:
                     st.error("Échec — réessayez.")
                     st.session_state.device_flow = None
@@ -180,11 +209,13 @@ def email_matches(email, keywords):
 # ── VÉRIFICATION TOKEN ────────────────────────────────────────
 cfg = get_auth_config()
 
-if not st.session_state.token:
+if not st.session_state.token or not st.session_state.user_mail:
     page_login(cfg)
     st.stop()
 
 token = st.session_state.token
+user_mail = st.session_state.user_mail
+user_db = get_user_db_path(user_mail)
 
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
@@ -198,7 +229,8 @@ with st.sidebar:
         st.success("✅ Connecté")
 
     if st.button("🚪 Déconnexion"):
-        for k in ["token", "token_cache", "device_flow"]:
+        for k in ["token", "token_cache", "device_flow", "user_id", "user_mail", 
+                  "live_expanded", "live_results", "live_query_done"]:
             st.session_state[k] = None
         st.rerun()
 
@@ -211,7 +243,7 @@ with st.sidebar:
     ])
     st.markdown("---")
     try:
-        conn  = sqlite3.connect(config.DB_PATH)
+        conn  = sqlite3.connect(user_db)
         count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
         conn.close()
         st.metric("📧 Emails indexés", f"{count:,}")
@@ -247,7 +279,7 @@ if menu == "🔍 Recherche":
         if query:
             try:
                 from src.search_engine import SearchEngine
-                engine   = SearchEngine()
+                engine   = SearchEngine(db_path=user_db)  # ← Passe la DB utilisateur
                 keywords = [kw.strip() for kw in query.split() if kw.strip()]
 
                 all_sets        = []
@@ -400,7 +432,7 @@ if menu == "🔍 Recherche":
 elif menu == "📊 Statistiques":
     st.title("📊 Statistiques")
     try:
-        conn = sqlite3.connect(config.DB_PATH)
+        conn = sqlite3.connect(user_db)
         df   = pd.read_sql_query(
             "SELECT sender, sender_email, date, is_read, has_attachments FROM emails", conn
         )
@@ -442,12 +474,12 @@ elif menu == "🔄 Synchronisation":
             from src.indexer import EmailIndexer
 
             with st.spinner("📥 Récupération des emails (sans limite)..."):
-                fetcher = EmailFetcher(token=token)
+                fetcher = EmailFetcher(token=token, db_path=user_db)  # ← Passe la DB utilisateur
                 total   = fetcher.fetch_all_emails()
                 st.success(f"✅ {total} emails récupérés !")
 
             with st.spinner("🔍 Indexation en cours..."):
-                indexer = EmailIndexer()
+                indexer = EmailIndexer(db_path=user_db)  # ← Passe la DB utilisateur
                 indexed = indexer.index_all_emails()
                 st.success(f"✅ {indexed} emails indexés !")
 
