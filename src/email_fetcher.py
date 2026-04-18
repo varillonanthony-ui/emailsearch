@@ -17,6 +17,7 @@ class EmailFetcher:
         self.token = token or self._get_token()
         self.db_path = db_path or config.DB_PATH
         self.user_email = user_email or config.USER_EMAIL
+        self.graph_base = config.GRAPH_ENDPOINT
 
         self.headers = {
             "Authorization": f"Bearer {self.token}",
@@ -41,7 +42,7 @@ class EmailFetcher:
         os.makedirs("data", exist_ok=True)
         conn   = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Table principale des emails
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS emails (
@@ -60,7 +61,7 @@ class EmailFetcher:
                 last_synced      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
         # Table de suivi des synchronisations
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sync_log (
@@ -71,7 +72,7 @@ class EmailFetcher:
                 last_email_date TEXT
             )
         """)
-        
+
         conn.commit()
         conn.close()
 
@@ -85,7 +86,7 @@ class EmailFetcher:
         """, (self.user_email,))
         result = cursor.fetchone()
         conn.close()
-        
+
         if result and result[0]:
             return result[0]  # Format: "2024-01-15T10:30:00Z"
         return None
@@ -93,14 +94,14 @@ class EmailFetcher:
     def fetch_all_emails(self, incremental=True, max_emails=None):
         """
         Récupère les emails avec mode incrémental
-        
+
         incremental=True  → ne récupère que les nouveaux depuis la dernière sync
         incremental=False → récupère TOUS les emails (lent)
         max_emails=None   → pas de limite
         """
-        
+
         last_sync = self.get_last_sync_time() if incremental else None
-        
+
         # ✅ Construction du filtre
         filter_str = ""
         if last_sync and incremental:
@@ -113,14 +114,14 @@ class EmailFetcher:
 
         # ✅ URL de base avec pagination
         url = (
-            f"{config.GRAPH_ENDPOINT}/me/messages"
+            f"{self.graph_base}/me/messages"
             f"?$top=100"
             f"&$select=id,subject,from,toRecipients,receivedDateTime"
             f",bodyPreview,body,parentFolderId,isRead,hasAttachments"
             f"&$orderby=receivedDateTime desc"
             f"{filter_str}"
         )
-        
+
         total_fetched = 0
         total_updated = 0
         conn = sqlite3.connect(self.db_path)
@@ -167,7 +168,7 @@ class EmailFetcher:
                         self.user_email
                     ))
                     total_fetched += 1
-                    
+
                     # Compter les mises à jour (rowcount > 0 si UPDATE)
                     if cursor.rowcount > 0:
                         total_updated += 1
@@ -181,7 +182,7 @@ class EmailFetcher:
                         return total_fetched
 
                 conn.commit()
-                
+
                 # ✅ Prochaine page
                 url = data.get("@odata.nextLink")
                 if url:
@@ -199,7 +200,7 @@ class EmailFetcher:
         # ✅ Log la synchronisation
         self._log_sync(total_fetched, total_updated)
         conn.close()
-        
+
         print(f"🎉 {total_fetched} emails récupérés ({total_updated} nouveaux/mis à jour)")
         return total_fetched
 
@@ -207,15 +208,99 @@ class EmailFetcher:
         """Enregistre les stats de synchronisation"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Récupère la date du dernier email
         cursor.execute("SELECT MAX(date) FROM emails WHERE user_email = ?", 
                        (self.user_email,))
         last_date = cursor.fetchone()[0]
-        
+
         cursor.execute("""
             INSERT INTO sync_log (sync_time, emails_fetched, emails_updated, last_email_date)
             VALUES (CURRENT_TIMESTAMP, ?, ?, ?)
         """, (fetched, updated, last_date))
         conn.commit()
         conn.close()
+
+    def search_emails(self, query, limit=50):
+        """Recherche les emails par subject ou body"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        search_term = f"%{query}%"
+        cursor.execute("""
+            SELECT id, subject, sender, sender_email, date, body_preview
+            FROM emails
+            WHERE user_email = ?
+            AND (subject LIKE ? OR body_preview LIKE ?)
+            ORDER BY date DESC
+            LIMIT ?
+        """, (self.user_email, search_term, search_term, limit))
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        return results
+
+    def get_email_body(self, email_id):
+        """Récupère le corps complet d'un email"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT subject, sender, sender_email, date, body, recipients
+            FROM emails
+            WHERE id = ? AND user_email = ?
+        """, (email_id, self.user_email))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                "subject": result[0],
+                "sender": result[1],
+                "sender_email": result[2],
+                "date": result[3],
+                "body": result[4],
+                "recipients": json.loads(result[5]) if result[5] else []
+            }
+        return None
+
+    def get_stats(self):
+        """Récupère les statistiques des emails"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Total d'emails
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ?", 
+                       (self.user_email,))
+        total_emails = cursor.fetchone()[0]
+        
+        # Emails non lus
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ? AND is_read = 0", 
+                       (self.user_email,))
+        unread_emails = cursor.fetchone()[0]
+        
+        # Emails avec pièces jointes
+        cursor.execute("SELECT COUNT(*) FROM emails WHERE user_email = ? AND has_attachments = 1", 
+                       (self.user_email,))
+        emails_with_attachments = cursor.fetchone()[0]
+        
+        # Dernière synchro
+        cursor.execute("""
+            SELECT sync_time, emails_fetched 
+            FROM sync_log 
+            ORDER BY sync_time DESC 
+            LIMIT 1
+        """)
+        sync_info = cursor.fetchone()
+        
+        conn.close()
+        
+        return {
+            "total_emails": total_emails,
+            "unread_emails": unread_emails,
+            "emails_with_attachments": emails_with_attachments,
+            "last_sync_time": sync_info[0] if sync_info else None,
+            "last_sync_count": sync_info[1] if sync_info else None
+        }
