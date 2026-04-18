@@ -73,7 +73,6 @@ if menu == "🔍 Recherche":
                 for r in res:
                     all_results_map[r['id']] = r
 
-            # Garder uniquement les emails qui contiennent TOUS les mots clés
             if all_sets:
                 common_ids = all_sets[0].intersection(*all_sets[1:])
             else:
@@ -113,6 +112,7 @@ if menu == "🔍 Recherche":
                     f"📧 {email['subject']} | 👤 {email['sender']} | 📅 {email['date'][:10]}"
                 ):
                     st.markdown(f"**De :** {email['sender']} ({email['sender_email']})")
+                    st.markdown(f"**À :** {email.get('to', 'N/A')}")  # ← AJOUT
                     st.markdown(f"**Date :** {email['date']}")
                     st.markdown(f"**Aperçu :** {email['body_preview']}")
                     st.markdown(f"**Score :** {email['score']:.2f}")
