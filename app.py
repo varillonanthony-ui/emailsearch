@@ -14,9 +14,71 @@ st.set_page_config(
     layout="wide"
 )
 
+# ── AUTHENTIFICATION MICROSOFT ───────────────────────────────
+from msal import ConfidentialClientApplication
+
+REDIRECT_URI = "https://votre-app.streamlit.app"  # ← changez ici
+
+def get_auth_url():
+    app = ConfidentialClientApplication(
+        config.CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{config.TENANT_ID}",
+        client_credential=config.CLIENT_SECRET
+    )
+    return app.get_authorization_request_url(
+        scopes=["User.Read"],
+        redirect_uri=REDIRECT_URI
+    )
+
+# Vérifier si l'utilisateur est connecté
+if "user" not in st.session_state:
+    st.title("🔐 Connexion requise")
+    st.markdown("Connectez-vous avec votre compte Microsoft pour accéder à l'application.")
+    
+    auth_url = get_auth_url()
+    st.link_button("🔑 Se connecter avec Microsoft", auth_url)
+    
+    # Récupérer le code de retour
+    params = st.query_params
+    if "code" in params:
+        with st.spinner("Connexion en cours..."):
+            try:
+                import requests
+                msal_app = ConfidentialClientApplication(
+                    config.CLIENT_ID,
+                    authority=f"https://login.microsoftonline.com/{config.TENANT_ID}",
+                    client_credential=config.CLIENT_SECRET
+                )
+                result = msal_app.acquire_token_by_authorization_code(
+                    params["code"],
+                    scopes=["User.Read"],
+                    redirect_uri=REDIRECT_URI
+                )
+                if "access_token" in result:
+                    # Récupérer infos utilisateur
+                    headers = {"Authorization": f"Bearer {result['access_token']}"}
+                    me = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers).json()
+                    st.session_state["user"] = me
+                    st.query_params.clear()
+                    st.rerun()
+                else:
+                    st.error(f"❌ Erreur : {result.get('error_description')}")
+            except Exception as e:
+                st.error(f"❌ Exception : {e}")
+    st.stop()
+
+# ── UTILISATEUR CONNECTÉ ─────────────────────────────────────
+user = st.session_state["user"]
+
 # ── SIDEBAR ──────────────────────────────────────────────────
 with st.sidebar:
     st.title("📧 Email Search")
+    st.markdown("---")
+    st.success(f"👤 {user.get('displayName', 'Utilisateur')}")
+    st.caption(user.get('mail', ''))
+    if st.button("🚪 Déconnexion"):
+        del st.session_state["user"]
+        st.rerun()
     st.markdown("---")
     menu = st.radio("Navigation", [
         "🔍 Recherche",
@@ -63,7 +125,6 @@ if menu == "🔍 Recherche":
             from src.search_engine import SearchEngine
             engine = SearchEngine()
 
-            # ── Multi-mots clés : intersection ────────────
             keywords = [kw.strip() for kw in query.split() if kw.strip()]
 
             all_sets = []
@@ -81,7 +142,6 @@ if menu == "🔍 Recherche":
 
             results = [all_results_map[id] for id in common_ids]
 
-            # ── Filtre expéditeur ──────────────────────────
             if sender_filter:
                 results = [
                     r for r in results
@@ -89,21 +149,18 @@ if menu == "🔍 Recherche":
                     or sender_filter.lower() in r['sender_email'].lower()
                 ]
 
-            # ── Filtre date début ──────────────────────────
             if date_debut:
                 results = [
                     r for r in results
                     if r['date'][:10] >= str(date_debut)
                 ]
 
-            # ── Filtre date fin ────────────────────────────
             if date_fin:
                 results = [
                     r for r in results
                     if r['date'][:10] <= str(date_fin)
                 ]
 
-            # ── Affichage ──────────────────────────────────
             st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords)}")
             st.markdown(f"**{len(results)} résultat(s) trouvé(s)**")
             st.markdown("---")
@@ -114,7 +171,6 @@ if menu == "🔍 Recherche":
                 ):
                     st.markdown(f"**De :** {email['sender']} ({email['sender_email']})")
 
-                    # ── Affichage destinataires ────────────
                     to_raw = email.get('to', '')
                     try:
                         to_list = json.loads(to_raw)
