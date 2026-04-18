@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import sqlite3
-import json
+import requests, json, re, time, datetime, msal
 import sys, os
 
 sys.path.append(os.path.dirname(__file__))
-import config
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 st.set_page_config(
     page_title="📧 Email Search",
@@ -14,292 +15,218 @@ st.set_page_config(
     layout="wide"
 )
 
-# ── AUTHENTIFICATION MICROSOFT ───────────────────────────────
-from msal import ConfidentialClientApplication
+# ── SESSION STATE ─────────────────────────────────────────────
+for k, v in [("token", None), ("device_flow", None), ("msal_app", None),
+             ("msal_cache", None), ("token_cache", None)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-REDIRECT_URI = "https://votre-app.streamlit.app"  # ← changez ici
+# ── CONFIG ────────────────────────────────────────────────────
+def get_config():
+    return {
+        "azure": {
+            "client_id": st.secrets["AZURE_CLIENT_ID"],
+            "tenant_id": st.secrets["AZURE_TENANT_ID"],
+            "scopes": ["Mail.Read", "Mail.ReadWrite"]
+        }
+    }
 
-def get_auth_url():
-    app = ConfidentialClientApplication(
-        config.CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{config.TENANT_ID}",
-        client_credential=config.CLIENT_SECRET
+# ── AUTH ──────────────────────────────────────────────────────
+def init_auth(config):
+    cache = msal.SerializableTokenCache()
+    if st.session_state.token_cache:
+        cache.deserialize(st.session_state.token_cache)
+    app = msal.PublicClientApplication(
+        client_id=config["azure"]["client_id"],
+        authority=f"https://login.microsoftonline.com/{config['azure']['tenant_id']}",
+        token_cache=cache
     )
-    return app.get_authorization_request_url(
-        scopes=["User.Read"],
-        redirect_uri=REDIRECT_URI
-    )
+    return app, cache
 
-# Vérifier si l'utilisateur est connecté
-if "user" not in st.session_state:
-    st.title("🔐 Connexion requise")
-    st.markdown("Connectez-vous avec votre compte Microsoft pour accéder à l'application.")
-    
-    auth_url = get_auth_url()
-    st.markdown(f'<a href="{auth_url}" target="_self"><button style="background-color:#0078d4;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;font-size:16px;">🔑 Se connecter avec Microsoft</button></a>', unsafe_allow_html=True)
-    
-    # Récupérer le code de retour
-    params = st.query_params
-    if "code" in params:
-        with st.spinner("Connexion en cours..."):
-            try:
-                import requests
-                msal_app = ConfidentialClientApplication(
-                    config.CLIENT_ID,
-                    authority=f"https://login.microsoftonline.com/{config.TENANT_ID}",
-                    client_credential=config.CLIENT_SECRET
-                )
-                result = msal_app.acquire_token_by_authorization_code(
-                    params["code"],
-                    scopes=["User.Read"],
-                    redirect_uri=REDIRECT_URI
-                )
-                if "access_token" in result:
-                    # Récupérer infos utilisateur
-                    headers = {"Authorization": f"Bearer {result['access_token']}"}
-                    me = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers).json()
-                    st.session_state["user"] = me
-                    st.query_params.clear()
-                    st.rerun()
-                else:
-                    st.error(f"❌ Erreur : {result.get('error_description')}")
-            except Exception as e:
-                st.error(f"❌ Exception : {e}")
-    st.stop()
+def try_silent_auth(config):
+    app, cache = init_auth(config)
+    accounts = app.get_accounts()
+    if accounts:
+        result = app.acquire_token_silent(config["azure"]["scopes"], account=accounts[0])
+        if result and "access_token" in result:
+            st.session_state.token_cache = cache.serialize()
+            return result["access_token"]
+    return None
 
-# ── UTILISATEUR CONNECTÉ ─────────────────────────────────────
-user = st.session_state["user"]
+def start_device_flow(config):
+    app, cache = init_auth(config)
+    flow = app.initiate_device_flow(scopes=config["azure"]["scopes"])
+    st.session_state.device_flow = flow
+    st.session_state.msal_app = app
+    st.session_state.msal_cache = cache
+    return flow
 
-# ── SIDEBAR ──────────────────────────────────────────────────
-with st.sidebar:
+def complete_device_flow():
+    app = st.session_state.msal_app
+    flow = st.session_state.device_flow
+    cache = st.session_state.msal_cache
+    if not app or not flow:
+        return None
+    result = app.acquire_token_by_device_flow(flow)
+    if "access_token" in result:
+        st.session_state.token_cache = cache.serialize()
+        return result["access_token"]
+    return None
+
+# ── PAGE LOGIN ────────────────────────────────────────────────
+def page_login(config):
     st.title("📧 Email Search")
     st.markdown("---")
-    st.success(f"👤 {user.get('displayName', 'Utilisateur')}")
-    st.caption(user.get('mail', ''))
-    if st.button("🚪 Déconnexion"):
-        del st.session_state["user"]
-        st.rerun()
-    st.markdown("---")
-    menu = st.radio("Navigation", [
-        "🔍 Recherche",
-        "📊 Statistiques",
-        "🔄 Synchronisation",
-        "🔧 Debug"
-    ])
-    st.markdown("---")
-    try:
-        conn  = sqlite3.connect(config.DB_PATH)
-        count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
-        conn.close()
-        st.metric("📧 Emails indexés", f"{count:,}")
-    except:
-        st.warning("⚠️ Base non initialisée")
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown("### Connexion Office 365")
 
-# ── PAGE RECHERCHE ───────────────────────────────────────────
-if menu == "🔍 Recherche":
-    st.title("🔍 Recherche d'emails")
+        # Tentative silencieuse
+        token = try_silent_auth(config)
+        if token:
+            st.session_state.token = token
+            st.rerun()
 
+        if not st.session_state.device_flow:
+            if st.button("Se connecter avec Office 365", use_container_width=True, type="primary"):
+                with st.spinner("Initialisation..."):
+                    start_device_flow(config)
+                st.rerun()
+        else:
+            flow = st.session_state.device_flow
+            code_match = re.search(r'enter the code ([A-Z0-9]+)', flow.get("message", ""))
+            code = code_match.group(1) if code_match else ""
+
+            st.info("**Etape 1** — Ouvrez : [https://microsoft.com/devicelogin](https://microsoft.com/devicelogin)")
+            st.info("**Etape 2** — Entrez ce code :")
+            st.code(code, language=None)
+            st.markdown("**Etape 3** — Connectez-vous puis cliquez :")
+
+            if st.button("J'ai entré le code, continuer", use_container_width=True, type="primary"):
+                with st.spinner("Vérification..."):
+                    token = complete_device_flow()
+                if token:
+                    st.session_state.token = token
+                    st.session_state.device_flow = None
+                    st.rerun()
+                else:
+                    st.error("Échec — réessayez.")
+                    st.session_state.device_flow = None
+
+# ── GRAPH HELPERS ─────────────────────────────────────────────
+def graph_get(token, endpoint):
+    r = requests.get(
+        f"{GRAPH_BASE}{endpoint}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15
+    )
+    r.raise_for_status()
+    return r.json()
+
+def clean_html(html):
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
+
+# ── PAGES DE VOTRE APP ────────────────────────────────────────
+def page_emails(token):
+    st.title("📧 Recherche d'emails")
+    
     col1, col2 = st.columns([3, 1])
     with col1:
-        query = st.text_input(
-            "Rechercher",
-            placeholder="Ex: facture janvier, réunion projet..."
-        )
+        search_query = st.text_input("🔍 Rechercher dans les emails", placeholder="Entrez un mot-clé...")
     with col2:
-        search_in = st.multiselect(
-            "Chercher dans",
-            ["subject", "body", "sender"],
-            default=["subject", "body"]
-        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        search_btn = st.button("Rechercher", type="primary", use_container_width=True)
 
-    with st.expander("🔧 Filtres avancés"):
-        col3, col4 = st.columns(2)
-        with col3:
-            date_debut = st.date_input("Date début", value=None)
-        with col4:
-            date_fin   = st.date_input("Date fin", value=None)
-        sender_filter = st.text_input("Expéditeur")
+    if search_btn and search_query:
+        with st.spinner("Recherche en cours..."):
+            try:
+                data = graph_get(token, f"/me/messages?$search=\"{search_query}\"&$top=20&$select=subject,from,receivedDateTime,bodyPreview")
+                emails = data.get("value", [])
+                
+                if not emails:
+                    st.info("Aucun email trouvé.")
+                else:
+                    st.success(f"✅ {len(emails)} email(s) trouvé(s)")
+                    for email in emails:
+                        subject = email.get("subject", "(sans objet)")
+                        sender = email.get("from", {}).get("emailAddress", {})
+                        sender_name = sender.get("name", "")
+                        sender_email = sender.get("address", "")
+                        date = email.get("receivedDateTime", "")[:10]
+                        preview = email.get("bodyPreview", "")
 
-    if query:
+                        with st.expander(f"📧 **{subject}** — {sender_name} ({date})"):
+                            st.markdown(f"**De :** {sender_name} <{sender_email}>")
+                            st.markdown(f"**Date :** {date}")
+                            st.markdown(f"**Aperçu :** {preview}")
+
+            except Exception as e:
+                st.error(f"Erreur : {e}")
+
+def page_stats(token):
+    st.title("📊 Statistiques")
+    with st.spinner("Chargement..."):
         try:
-            from src.search_engine import SearchEngine
-            engine = SearchEngine()
+            data = graph_get(token, "/me/messages?$top=50&$select=receivedDateTime,from,isRead")
+            emails = data.get("value", [])
+            
+            if emails:
+                df = pd.DataFrame([{
+                    "date": e.get("receivedDateTime", "")[:10],
+                    "sender": e.get("from", {}).get("emailAddress", {}).get("address", ""),
+                    "isRead": e.get("isRead", False)
+                } for e in emails])
 
-            keywords = [kw.strip() for kw in query.split() if kw.strip()]
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total emails", len(df))
+                with col2:
+                    st.metric("Non lus", len(df[df["isRead"] == False]))
+                with col3:
+                    st.metric("Lus", len(df[df["isRead"] == True]))
 
-            all_sets = []
-            all_results_map = {}
-            for keyword in keywords:
-                res = engine.search(keyword, fields=search_in)
-                all_sets.append(set(r['id'] for r in res))
-                for r in res:
-                    all_results_map[r['id']] = r
-
-            if all_sets:
-                common_ids = all_sets[0].intersection(*all_sets[1:])
-            else:
-                common_ids = set()
-
-            results = [all_results_map[id] for id in common_ids]
-
-            if sender_filter:
-                results = [
-                    r for r in results
-                    if sender_filter.lower() in r['sender'].lower()
-                    or sender_filter.lower() in r['sender_email'].lower()
-                ]
-
-            if date_debut:
-                results = [
-                    r for r in results
-                    if r['date'][:10] >= str(date_debut)
-                ]
-
-            if date_fin:
-                results = [
-                    r for r in results
-                    if r['date'][:10] <= str(date_fin)
-                ]
-
-            st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords)}")
-            st.markdown(f"**{len(results)} résultat(s) trouvé(s)**")
-            st.markdown("---")
-
-            for email in results:
-                with st.expander(
-                    f"📧 {email['subject']} | 👤 {email['sender']} | 📅 {email['date'][:10]}"
-                ):
-                    st.markdown(f"**De :** {email['sender']} ({email['sender_email']})")
-
-                    to_raw = email.get('to', '')
-                    try:
-                        to_list = json.loads(to_raw)
-                        to_display = ", ".join(
-                            f"{r['emailAddress']['name']} <{r['emailAddress']['address']}>"
-                            for r in to_list
-                        )
-                    except:
-                        to_display = to_raw or "N/A"
-                    st.markdown(f"**À :** {to_display}")
-
-                    st.markdown(f"**Date :** {email['date']}")
-                    st.markdown(f"**Aperçu :** {email['body_preview']}")
-                    st.markdown(f"**Score :** {email['score']:.2f}")
-
-                    if st.button("Voir email complet", key=email['id']):
-                        detail = engine.get_email_detail(email['id'])
-                        st.markdown("---")
-                        st.markdown(detail['body'], unsafe_allow_html=True)
-
+                fig = px.histogram(df, x="date", title="Emails par date")
+                st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.error(f"Erreur : {e}")
-            st.info("💡 Lancez d'abord une synchronisation !")
 
-# ── PAGE STATISTIQUES ────────────────────────────────────────
-elif menu == "📊 Statistiques":
-    st.title("📊 Statistiques")
-    try:
-        conn = sqlite3.connect(config.DB_PATH)
-        df   = pd.read_sql_query(
-            "SELECT sender, sender_email, date, is_read, has_attachments FROM emails",
-            conn
-        )
-        conn.close()
+# ── MAIN ──────────────────────────────────────────────────────
+def main():
+    config = get_config()
 
-        df["date"] = pd.to_datetime(df["date"])
-        df["mois"] = df["date"].dt.to_period("M").astype(str)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total emails",        len(df))
-        col2.metric("Emails non lus",      len(df[df["is_read"] == 0]))
-        col3.metric("Avec pièces jointes", len(df[df["has_attachments"] == 1]))
-
+    # Sidebar
+    with st.sidebar:
+        st.title("📧 Email Search")
         st.markdown("---")
 
-        emails_par_mois = df.groupby("mois").size().reset_index(name="count")
-        fig1 = px.bar(
-            emails_par_mois, x="mois", y="count",
-            title="📅 Emails reçus par mois"
-        )
-        st.plotly_chart(fig1, use_container_width=True)
+        if st.session_state.token:
+            # Infos utilisateur
+            try:
+                me = graph_get(st.session_state.token, "/me")
+                st.success(f"✅ {me.get('displayName', '')}")
+                st.caption(me.get('mail', ''))
+            except:
+                st.success("✅ Connecté")
 
-        top_senders = (
-            df.groupby("sender_email")
-            .size()
-            .reset_index(name="count")
-            .sort_values("count", ascending=False)
-            .head(10)
-        )
-        fig2 = px.bar(
-            top_senders, x="count", y="sender_email",
-            orientation="h", title="👥 Top 10 expéditeurs"
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+            st.markdown("---")
+            page = st.radio("Navigation", ["📧 Emails", "📊 Statistiques"])
+            st.markdown("---")
 
-    except Exception as e:
-        st.error(f"Erreur : {e}")
+            if st.button("🚪 Se déconnecter"):
+                for k in ["token", "token_cache", "device_flow"]:
+                    st.session_state[k] = None
+                st.rerun()
+        else:
+            st.info("Connectez-vous pour accéder à l'application.")
+            page = "login"
 
-# ── PAGE SYNCHRONISATION ─────────────────────────────────────
-elif menu == "🔄 Synchronisation":
-    st.title("🔄 Synchronisation des emails")
+    # Routing
+    if not st.session_state.token:
+        page_login(config)
+    elif page == "📧 Emails":
+        page_emails(st.session_state.token)
+    elif page == "📊 Statistiques":
+        page_stats(st.session_state.token)
 
-    st.info("""
-    **Avant de synchroniser, vérifiez que les secrets sont configurés :**
-    - AZURE_CLIENT_ID
-    - AZURE_CLIENT_SECRET
-    - AZURE_TENANT_ID
-    - USER_EMAIL
-    """)
-
-    max_emails = st.slider("Nombre max d'emails à récupérer", 100, 5000, 1000, 100)
-
-    if st.button("🚀 Lancer la synchronisation", type="primary"):
-        try:
-            from src.email_fetcher import EmailFetcher
-            from src.indexer import EmailIndexer
-
-            with st.spinner("📥 Récupération des emails..."):
-                fetcher = EmailFetcher()
-                total   = fetcher.fetch_all_emails(max_emails=max_emails)
-                st.success(f"✅ {total} emails récupérés !")
-
-            with st.spinner("🔍 Indexation en cours..."):
-                indexer = EmailIndexer()
-                indexed = indexer.index_all_emails()
-                st.success(f"✅ {indexed} emails indexés !")
-
-            st.balloons()
-
-        except Exception as e:
-            st.error(f"❌ Erreur : {e}")
-
-# ── PAGE DEBUG ───────────────────────────────────────────────
-elif menu == "🔧 Debug":
-    st.title("🔧 Test connexion API")
-
-    if st.button("Tester la connexion"):
-        try:
-            import requests
-            from msal import ConfidentialClientApplication
-
-            app = ConfidentialClientApplication(
-                config.CLIENT_ID,
-                authority=f"https://login.microsoftonline.com/{config.TENANT_ID}",
-                client_credential=config.CLIENT_SECRET
-            )
-            result = app.acquire_token_for_client(scopes=config.SCOPES)
-
-            if "access_token" in result:
-                st.success("✅ Token obtenu !")
-
-                headers  = {"Authorization": f"Bearer {result['access_token']}"}
-                url      = f"{config.GRAPH_ENDPOINT}/users/{config.USER_EMAIL}/messages?$top=5"
-                response = requests.get(url, headers=headers)
-
-                st.write("**Status HTTP :**", response.status_code)
-                st.json(response.json())
-            else:
-                st.error(f"❌ Erreur token : {result.get('error_description')}")
-
-        except Exception as e:
-            st.error(f"❌ Exception : {e}")
+if __name__ == "__main__":
+    main()
