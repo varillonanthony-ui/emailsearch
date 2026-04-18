@@ -16,6 +16,54 @@ st.set_page_config(
     layout="wide"
 )
 
+# ── CRÉER LES TABLES SI ELLES N'EXISTENT PAS ──────────────────
+def create_tables(db_path):
+    """Crée la structure de la BD si elle n'existe pas"""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Table principale des emails
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                email_id TEXT UNIQUE NOT NULL,
+                subject TEXT,
+                sender TEXT,
+                sender_email TEXT,
+                date TEXT,
+                body TEXT,
+                body_preview TEXT,
+                to_recipients TEXT,
+                folder TEXT,
+                is_read BOOLEAN DEFAULT 0,
+                has_attachments BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Table de synchronisation
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                sync_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                emails_fetched INTEGER DEFAULT 0,
+                emails_updated INTEGER DEFAULT 0,
+                last_email_date TEXT,
+                status TEXT DEFAULT 'success',
+                error_message TEXT
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ Erreur création tables : {e}")
+        return False
+
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # ── SESSION STATE ─────────────────────────────────────────────
@@ -247,6 +295,9 @@ token = st.session_state.token
 user_mail = st.session_state.user_mail
 user_db = get_user_db_path(user_mail)
 user_index = get_user_index_path(user_mail)
+
+# ✅ CRÉER LES TABLES AU DÉMARRAGE
+create_tables(user_db)
 
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
@@ -618,18 +669,18 @@ st.markdown("---")
 st.markdown("### 🔧 DEBUG")
 
 if st.checkbox("🔍 Voir l'état de la BD"):
-    
+
     try:
-        conn = sqlite3.connect("emails.db")
+        conn = sqlite3.connect(user_db)
         cursor = conn.cursor()
-        
+
         # Voir TOUTES les tables
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = cursor.fetchall()
-        
+
         st.write("**Tables existantes en BD :**")
         st.json([t[0] for t in tables])
-        
+
         # Si des tables existent, montre leur contenu
         if tables:
             for table_name in tables:
@@ -637,14 +688,14 @@ if st.checkbox("🔍 Voir l'état de la BD"):
                 cursor.execute(f"SELECT COUNT(*) FROM {table_name[0]}")
                 count = cursor.fetchone()[0]
                 st.write(f"Nombre de lignes : {count}")
-                
+
                 # Affiche un aperçu
                 if count > 0:
                     cursor.execute(f"SELECT * FROM {table_name[0]} LIMIT 3")
                     columns = [description[0] for description in cursor.description]
                     st.write(f"Colonnes : {columns}")
-        
+
         conn.close()
-        
+
     except Exception as e:
         st.error(f"Erreur BD : {e}")
