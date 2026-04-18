@@ -52,17 +52,59 @@ if menu == "🔍 Recherche":
     with st.expander("🔧 Filtres avancés"):
         col3, col4 = st.columns(2)
         with col3:
-            date_debut = st.date_input("Date début")
+            date_debut = st.date_input("Date début", value=None)
         with col4:
-            date_fin   = st.date_input("Date fin")
+            date_fin   = st.date_input("Date fin", value=None)
         sender_filter = st.text_input("Expéditeur")
 
     if query:
         try:
             from src.search_engine import SearchEngine
-            engine  = SearchEngine()
-            results = engine.search(query, fields=search_in)
+            engine = SearchEngine()
 
+            # ── Multi-mots clés : intersection ────────────
+            keywords = [kw.strip() for kw in query.split() if kw.strip()]
+
+            all_sets = []
+            all_results_map = {}
+            for keyword in keywords:
+                res = engine.search(keyword, fields=search_in)
+                all_sets.append(set(r['id'] for r in res))
+                for r in res:
+                    all_results_map[r['id']] = r
+
+            # Garder uniquement les emails qui contiennent TOUS les mots clés
+            if all_sets:
+                common_ids = all_sets[0].intersection(*all_sets[1:])
+            else:
+                common_ids = set()
+
+            results = [all_results_map[id] for id in common_ids]
+
+            # ── Filtre expéditeur ──────────────────────────
+            if sender_filter:
+                results = [
+                    r for r in results
+                    if sender_filter.lower() in r['sender'].lower()
+                    or sender_filter.lower() in r['sender_email'].lower()
+                ]
+
+            # ── Filtre date début ──────────────────────────
+            if date_debut:
+                results = [
+                    r for r in results
+                    if r['date'][:10] >= str(date_debut)
+                ]
+
+            # ── Filtre date fin ────────────────────────────
+            if date_fin:
+                results = [
+                    r for r in results
+                    if r['date'][:10] <= str(date_fin)
+                ]
+
+            # ── Affichage ──────────────────────────────────
+            st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords)}")
             st.markdown(f"**{len(results)} résultat(s) trouvé(s)**")
             st.markdown("---")
 
@@ -79,6 +121,7 @@ if menu == "🔍 Recherche":
                         detail = engine.get_email_detail(email['id'])
                         st.markdown("---")
                         st.markdown(detail['body'], unsafe_allow_html=True)
+
         except Exception as e:
             st.error(f"Erreur : {e}")
             st.info("💡 Lancez d'abord une synchronisation !")
@@ -98,8 +141,8 @@ elif menu == "📊 Statistiques":
         df["mois"] = df["date"].dt.to_period("M").astype(str)
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total emails",      len(df))
-        col2.metric("Emails non lus",    len(df[df["is_read"] == 0]))
+        col1.metric("Total emails",        len(df))
+        col2.metric("Emails non lus",      len(df[df["is_read"] == 0]))
         col3.metric("Avec pièces jointes", len(df[df["has_attachments"] == 1]))
 
         st.markdown("---")
@@ -152,8 +195,8 @@ elif menu == "🔄 Synchronisation":
                 st.success(f"✅ {total} emails récupérés !")
 
             with st.spinner("🔍 Indexation en cours..."):
-                indexer  = EmailIndexer()
-                indexed  = indexer.index_all_emails()
+                indexer = EmailIndexer()
+                indexed = indexer.index_all_emails()
                 st.success(f"✅ {indexed} emails indexés !")
 
             st.balloons()
