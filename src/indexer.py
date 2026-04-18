@@ -7,7 +7,14 @@ import config
 
 class EmailIndexer:
 
-    def __init__(self):
+    def __init__(self, db_path=None, index_path=None):
+        """
+        db_path: chemin vers la DB SQLite (optional)
+        index_path: chemin vers l'index Whoosh (optional)
+        """
+        self.db_path = db_path or config.DB_PATH
+        self.index_path = index_path or config.INDEX_PATH
+        
         self.schema = Schema(
             id           = ID(stored=True, unique=True),
             subject      = TEXT(stored=True, analyzer=StemmingAnalyzer()),
@@ -18,14 +25,15 @@ class EmailIndexer:
             body_preview = TEXT(stored=True),
             folder       = ID(stored=True),
         )
-        os.makedirs(config.INDEX_PATH, exist_ok=True)
-        if index.exists_in(config.INDEX_PATH):
-            self.ix = index.open_dir(config.INDEX_PATH)
+        
+        os.makedirs(self.index_path, exist_ok=True)
+        if index.exists_in(self.index_path):
+            self.ix = index.open_dir(self.index_path)
         else:
-            self.ix = index.create_in(config.INDEX_PATH, self.schema)
+            self.ix = index.create_in(self.index_path, self.schema)
 
     def index_all_emails(self):
-        conn   = sqlite3.connect(config.DB_PATH)
+        conn   = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id,subject,sender,sender_email,date,body,body_preview,folder FROM emails"
