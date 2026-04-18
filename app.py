@@ -99,6 +99,30 @@ def get_user_index_path(user_mail):
     base_dir = os.path.dirname(config.INDEX_PATH)
     return os.path.join(base_dir, f"index_{user_hash}")
 
+def get_sync_stats(user_db):
+    """Récupère les stats de la dernière synchronisation"""
+    try:
+        conn = sqlite3.connect(user_db)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT sync_time, emails_fetched, emails_updated, last_email_date 
+            FROM sync_log 
+            ORDER BY id DESC LIMIT 1
+        """)
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                "sync_time": result[0],
+                "emails_fetched": result[1],
+                "emails_updated": result[2],
+                "last_email_date": result[3]
+            }
+    except:
+        pass
+    return None
+
 # ── PAGE LOGIN ────────────────────────────────────────────────
 def page_login(cfg):
     st.title("📧 Email Search")
@@ -249,11 +273,19 @@ with st.sidebar:
         "🔧 Debug"
     ])
     st.markdown("---")
+    
+    # ── STATS EN SIDEBAR ──────────────────────────────────────
     try:
         conn  = sqlite3.connect(user_db)
         count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
         conn.close()
         st.metric("📧 Emails indexés", f"{count:,}")
+        
+        # Affiche la dernière synchro
+        sync_stats = get_sync_stats(user_db)
+        if sync_stats:
+            st.caption(f"📅 Dernière synchro : {sync_stats['sync_time'][:10]}")
+            st.caption(f"🆕 {sync_stats['emails_fetched']} récupérés")
     except:
         st.warning("⚠️ Base non initialisée")
 
@@ -445,26 +477,29 @@ elif menu == "📊 Statistiques":
         )
         conn.close()
 
-        df["date"] = pd.to_datetime(df["date"])
-        df["mois"] = df["date"].dt.to_period("M").astype(str)
+        if len(df) == 0:
+            st.warning("⚠️ Aucun email indexé. Lancez une synchronisation d'abord.")
+        else:
+            df["date"] = pd.to_datetime(df["date"])
+            df["mois"] = df["date"].dt.to_period("M").astype(str)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total emails",        len(df))
-        col2.metric("Emails non lus",      len(df[df["is_read"] == 0]))
-        col3.metric("Avec pièces jointes", len(df[df["has_attachments"] == 1]))
-        st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total emails",        len(df))
+            col2.metric("Emails non lus",      len(df[df["is_read"] == 0]))
+            col3.metric("Avec pièces jointes", len(df[df["has_attachments"] == 1]))
+            st.markdown("---")
 
-        fig1 = px.bar(df.groupby("mois").size().reset_index(name="count"),
-                      x="mois", y="count", title="📅 Emails reçus par mois")
-        st.plotly_chart(fig1, use_container_width=True)
+            fig1 = px.bar(df.groupby("mois").size().reset_index(name="count"),
+                          x="mois", y="count", title="📅 Emails reçus par mois")
+            st.plotly_chart(fig1, use_container_width=True)
 
-        top_senders = (df.groupby("sender_email").size()
-                       .reset_index(name="count")
-                       .sort_values("count", ascending=False)
-                       .head(10))
-        fig2 = px.bar(top_senders, x="count", y="sender_email",
-                      orientation="h", title="👥 Top 10 expéditeurs")
-        st.plotly_chart(fig2, use_container_width=True)
+            top_senders = (df.groupby("sender_email").size()
+                           .reset_index(name="count")
+                           .sort_values("count", ascending=False)
+                           .head(10))
+            fig2 = px.bar(top_senders, x="count", y="sender_email",
+                          orientation="h", title="👥 Top 10 expéditeurs")
+            st.plotly_chart(fig2, use_container_width=True)
 
     except Exception as e:
         st.error(f"Erreur : {e}")
@@ -473,26 +508,59 @@ elif menu == "📊 Statistiques":
 elif menu == "🔄 Synchronisation":
     st.title("🔄 Synchronisation des emails")
 
-    st.info("La synchronisation récupère **tous** vos emails sans limite via l'API Microsoft Graph.")
+    # ── STATS ACTUELLES ──────────────────────────────────────
+    sync_stats = get_sync_stats(user_db)
+    if sync_stats:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("📅 Dernière synchro", sync_stats['sync_time'][:10])
+        col2.metric("📬 Emails récupérés", sync_stats['emails_fetched'])
+        col3.metric("🆕 Nouveaux/modifiés", sync_stats['emails_updated'])
+        st.markdown("---")
 
-    if st.button("🚀 Lancer la synchronisation", type="primary"):
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.info("✅ La synchronisation est **incrémentale** — elle récupère uniquement les nouveaux emails depuis la dernière synchro.")
+    
+    with col2:
+        full_sync = st.checkbox("🔄 Forcer une synchro complète", value=False, 
+                                help="⚠️ Réanalyser TOUS les emails (lent)")
+
+    if st.button("🚀 Lancer la synchronisation", type="primary", use_container_width=True):
         try:
             from src.email_fetcher import EmailFetcher
             from src.indexer import EmailIndexer
 
-            # 1️⃣ Récupérer les emails
-            with st.spinner("📥 Récupération des emails (sans limite)..."):
+            # ✅ 1️⃣ Récupérer les emails (incrémental par défaut)
+            with st.spinner("📥 Récupération des emails..."):
                 fetcher = EmailFetcher(token=token, db_path=user_db, user_email=user_mail)
-                total_fetched = fetcher.fetch_all_emails()
-                st.success(f"✅ {total_fetched} emails récupérés !")
+                total_fetched = fetcher.fetch_all_emails(incremental=not full_sync)
+                
+                if total_fetched > 0:
+                    st.success(f"✅ {total_fetched} emails récupérés !")
+                else:
+                    st.info("ℹ️ Aucun nouvel email depuis la dernière synchronisation.")
 
-            # 2️⃣ Indexer les emails
-            with st.spinner("🔍 Indexation en cours..."):
-                indexer = EmailIndexer(db_path=user_db, index_path=user_index)
-                total_indexed = indexer.index_all_emails()
-                st.success(f"✅ {total_indexed} emails indexés !")
+            # ✅ 2️⃣ Indexer les emails (incrémental par défaut)
+            if total_fetched > 0:
+                with st.spinner("🔍 Indexation en cours..."):
+                    indexer = EmailIndexer(db_path=user_db, index_path=user_index)
+                    total_indexed = indexer.index_all_emails(incremental=not full_sync)
+                    st.success(f"✅ {total_indexed} emails indexés !")
 
-            st.balloons()
+                st.balloons()
+            
+            # ✅ Afficher les stats mises à jour
+            st.markdown("---")
+            st.subheader("📊 Résumé de la synchronisation")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("📧 Total indexé", total_fetched)
+            with col2:
+                conn = sqlite3.connect(user_db)
+                total_count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+                conn.close()
+                st.metric("📬 Emails en base", f"{total_count:,}")
 
         except Exception as e:
             st.error(f"❌ Erreur : {e}")
@@ -516,3 +584,24 @@ elif menu == "🔧 Debug":
 
         except Exception as e:
             st.error(f"❌ Exception : {e}")
+    
+    st.markdown("---")
+    st.subheader("🗄️ Infos Base de données")
+    try:
+        conn = sqlite3.connect(user_db)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM emails")
+        email_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM sync_log")
+        sync_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        col1, col2 = st.columns(2)
+        col1.metric("📧 Emails en base", email_count)
+        col2.metric("📅 Synchronisations", sync_count)
+        
+    except Exception as e:
+        st.error(f"Erreur : {e}")
