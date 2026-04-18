@@ -67,7 +67,7 @@ class EmailFetcher:
 
             for email in emails:
                 cursor.execute(
-                    "INSERT OR REPLACE INTO emails VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO emails VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         email.get("id"),
                         email.get("subject", ""),
