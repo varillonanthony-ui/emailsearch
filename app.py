@@ -316,21 +316,26 @@ if menu == "🔍 Recherche":
             sender_filter = st.text_input("Expéditeur")
 
         if query:
-            try:
-                from src.search_engine import SearchEngine
-                engine   = SearchEngine(db_path=user_db)  # ← Passe la DB utilisateur
-                keywords = [kw.strip() for kw in query.split() if kw.strip()]
+    try:
+        from src.search_engine import SearchEngine
+        engine   = SearchEngine(db_path=user_db)  # ✅ Correct
+        keywords = [kw.strip() for kw in query.split() if kw.strip()]
 
-                all_sets        = []
-                all_results_map = {}
-                for keyword in keywords:
-                    res = engine.search(keyword, fields=search_in)
-                    all_sets.append(set(r['id'] for r in res))
-                    for r in res:
-                        all_results_map[r['id']] = r
+        all_sets        = []
+        all_results_map = {}
+        for keyword in keywords:
+            res = engine.search(keyword)  # ❌ Enlève le paramètre 'fields=search_in'
+            all_sets.append(set(r['id'] for r in res))
+            for r in res:
+                all_results_map[r['id']] = r
 
-                common_ids = all_sets[0].intersection(*all_sets[1:]) if all_sets else set()
-                results    = [all_results_map[i] for i in common_ids]
+        common_ids = all_sets[0].intersection(*all_sets[1:]) if all_sets else set()
+        results    = [all_results_map[i] for i in common_ids]
+
+    except Exception as e:
+        st.error(f"❌ Erreur : {e}")
+        import traceback
+        st.error(traceback.format_exc())
 
                 if sender_filter:
                     results = [r for r in results if
