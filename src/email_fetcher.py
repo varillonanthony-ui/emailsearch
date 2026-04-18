@@ -58,8 +58,11 @@ class EmailFetcher:
         conn.commit()
         conn.close()
 
-    def fetch_all_emails(self, max_emails=5000):
-        # ✅ CORRECTION : utilise /me/ au lieu de /users/{email}
+    def fetch_all_emails(self, max_emails=None):
+        """
+        max_emails: limite maximale (None = pas de limite)
+        """
+        # ✅ CORRECTION : pas de limite par défaut
         url = (
             f"{config.GRAPH_ENDPOINT}/me/messages"
             f"?$top=100"
@@ -71,18 +74,18 @@ class EmailFetcher:
         conn   = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        while url and total < max_emails:
-            print(f"🔄 Fetch: {url[:80]}...")  # DEBUG
+        while url:  # ✅ Continue tant qu'il y a un nextLink
+            print(f"🔄 Fetch page: {url[:80]}...")
             response = requests.get(url, headers=self.headers)
             
             if response.status_code != 200:
                 print(f"❌ Erreur API: {response.status_code} - {response.text}")
                 break
             
-            data     = response.json()
-            emails   = data.get("value", [])
+            data   = response.json()
+            emails = data.get("value", [])
             
-            print(f"📧 {len(emails)} emails trouvés dans cette page")  # DEBUG
+            print(f"📧 {len(emails)} emails dans cette page")
 
             for email in emails:
                 cursor.execute(
@@ -99,16 +102,22 @@ class EmailFetcher:
                         email.get("parentFolderId", ""),
                         int(email.get("isRead", False)),
                         int(email.get("hasAttachments", False)),
-                        self.user_email  # ← Ajoute l'email utilisateur
+                        self.user_email
                     )
                 )
                 total += 1
 
+                # ✅ OPTIONNEL : limite locale si besoin
+                if max_emails and total >= max_emails:
+                    print(f"⚠️ Limite de {max_emails} atteinte, arrêt")
+                    conn.commit()
+                    conn.close()
+                    return total
+
             conn.commit()
             url = data.get("@odata.nextLink")
-            
-            print(f"✅ Total inséré: {total}, NextLink: {bool(url)}")  # DEBUG
+            print(f"✅ Total: {total}, NextLink: {bool(url)}")
 
         conn.close()
-        print(f"🎉 {total} emails sauvegardés en DB")  # DEBUG
+        print(f"🎉 {total} emails sauvegardés !")
         return total

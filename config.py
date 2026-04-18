@@ -15,7 +15,14 @@ except Exception:
     TENANT_ID     = os.getenv("AZURE_TENANT_ID")
     USER_EMAIL    = os.getenv("USER_EMAIL")
 
-DB_PATH        = "data/emails.db"
-INDEX_PATH     = "data/email_index"
+# ── DOSSIERS DE BASE ──────────────────────────────────────
+DATA_DIR       = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── CHEMINS PAR DÉFAUT (utiliser get_user_db_path dans app.py) ──
+DB_PATH        = os.path.join(DATA_DIR, "emails.db")
+INDEX_PATH     = os.path.join(DATA_DIR, "email_index")
+
+# ── CONFIG API ────────────────────────────────────────────
 GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
 SCOPES         = ["https://graph.microsoft.com/.default"]

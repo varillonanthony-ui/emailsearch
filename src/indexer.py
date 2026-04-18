@@ -14,7 +14,7 @@ class EmailIndexer:
         """
         self.db_path = db_path or config.DB_PATH
         self.index_path = index_path or config.INDEX_PATH
-        
+
         self.schema = Schema(
             id           = ID(stored=True, unique=True),
             subject      = TEXT(stored=True, analyzer=StemmingAnalyzer()),
@@ -25,7 +25,7 @@ class EmailIndexer:
             body_preview = TEXT(stored=True),
             folder       = ID(stored=True),
         )
-        
+
         os.makedirs(self.index_path, exist_ok=True)
         if index.exists_in(self.index_path):
             self.ix = index.open_dir(self.index_path)
@@ -33,25 +33,57 @@ class EmailIndexer:
             self.ix = index.create_in(self.index_path, self.schema)
 
     def index_all_emails(self):
-        conn   = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id,subject,sender,sender_email,date,body,body_preview,folder FROM emails"
-        )
-        emails = cursor.fetchall()
-        conn.close()
+        """Indexe tous les emails de la DB"""
+        try:
+            # ✅ Vérifie que la DB existe
+            if not os.path.exists(self.db_path):
+                raise FileNotFoundError(f"❌ DB non trouvée: {self.db_path}")
 
-        writer = self.ix.writer()
-        for e in emails:
-            writer.update_document(
-                id           = e[0],
-                subject      = e[1] or "",
-                sender       = e[2] or "",
-                sender_email = e[3] or "",
-                date         = e[4] or "",
-                body         = e[5] or "",
-                body_preview = e[6] or "",
-                folder       = e[7] or "",
+            conn   = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # ✅ Vérifie que la table existe
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='emails'")
+            if not cursor.fetchone():
+                raise Exception("❌ Table 'emails' n'existe pas dans la DB")
+            
+            # ✅ Récupère les emails
+            cursor.execute(
+                "SELECT id,subject,sender,sender_email,date,body,body_preview,folder FROM emails"
             )
-        writer.commit()
-        return len(emails)
+            emails = cursor.fetchall()
+            conn.close()
+
+            if not emails:
+                raise Exception("⚠️ Aucun email dans la DB! Récupère d'abord les emails.")
+
+            print(f"📧 {len(emails)} emails trouvés, indexation en cours...")
+
+            writer = self.ix.writer()
+            for i, e in enumerate(emails):
+                try:
+                    writer.update_document(
+                        id           = str(e[0]) if e[0] else "",
+                        subject      = str(e[1]) if e[1] else "",
+                        sender       = str(e[2]) if e[2] else "",
+                        sender_email = str(e[3]) if e[3] else "",
+                        date         = str(e[4]) if e[4] else "",
+                        body         = str(e[5]) if e[5] else "",
+                        body_preview = str(e[6]) if e[6] else "",
+                        folder       = str(e[7]) if e[7] else "",
+                    )
+                except Exception as err:
+                    print(f"⚠️ Erreur indexation email {e[0]}: {err}")
+                    continue
+                
+                # Progress bar
+                if (i + 1) % 500 == 0:
+                    print(f"  ✅ {i + 1}/{len(emails)} indexés...")
+
+            writer.commit()
+            print(f"🎉 {len(emails)} emails indexés avec succès !")
+            return len(emails)
+
+        except Exception as err:
+            print(f"❌ Erreur indexation: {err}")
+            return 0

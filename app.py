@@ -93,6 +93,12 @@ def get_user_db_path(user_mail):
     base_dir = os.path.dirname(config.DB_PATH)
     return os.path.join(base_dir, f"emails_{user_hash}.db")
 
+def get_user_index_path(user_mail):
+    """Génère un chemin d'index unique par utilisateur"""
+    user_hash = hashlib.md5(user_mail.encode()).hexdigest()[:8]
+    base_dir = os.path.dirname(config.INDEX_PATH)
+    return os.path.join(base_dir, f"index_{user_hash}")
+
 # ── PAGE LOGIN ────────────────────────────────────────────────
 def page_login(cfg):
     st.title("📧 Email Search")
@@ -216,6 +222,7 @@ if not st.session_state.token or not st.session_state.user_mail:
 token = st.session_state.token
 user_mail = st.session_state.user_mail
 user_db = get_user_db_path(user_mail)
+user_index = get_user_index_path(user_mail)
 
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
@@ -473,20 +480,24 @@ elif menu == "🔄 Synchronisation":
             from src.email_fetcher import EmailFetcher
             from src.indexer import EmailIndexer
 
+            # 1️⃣ Récupérer les emails
             with st.spinner("📥 Récupération des emails (sans limite)..."):
-                fetcher = EmailFetcher(token=token, db_path=user_db)  # ← Passe la DB utilisateur
-                total   = fetcher.fetch_all_emails()
-                st.success(f"✅ {total} emails récupérés !")
+                fetcher = EmailFetcher(token=token, db_path=user_db, user_email=user_mail)
+                total_fetched = fetcher.fetch_all_emails()
+                st.success(f"✅ {total_fetched} emails récupérés !")
 
+            # 2️⃣ Indexer les emails
             with st.spinner("🔍 Indexation en cours..."):
-                indexer = EmailIndexer(db_path=user_db)  # ← Passe la DB utilisateur
-                indexed = indexer.index_all_emails()
-                st.success(f"✅ {indexed} emails indexés !")
+                indexer = EmailIndexer(db_path=user_db, index_path=user_index)
+                total_indexed = indexer.index_all_emails()
+                st.success(f"✅ {total_indexed} emails indexés !")
 
             st.balloons()
 
         except Exception as e:
             st.error(f"❌ Erreur : {e}")
+            import traceback
+            st.error(traceback.format_exc())
 
 # ── PAGE DEBUG ────────────────────────────────────────────────
 elif menu == "🔧 Debug":
