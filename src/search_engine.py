@@ -1,7 +1,7 @@
 import sqlite3
 from whoosh import index
-from whoosh.qparser import MultifieldParser, QueryParser
-from whoosh.query import Or, And
+from whoosh.qparser import MultifieldParser
+from whoosh.query import Or
 import config
 
 class SearchEngine:
@@ -41,7 +41,6 @@ class SearchEngine:
                         except:
                             pass
                     if queries:
-                        from whoosh.query import Or
                         query = Or(queries)
                     else:
                         query = parser.parse(query_str)
@@ -67,14 +66,14 @@ class SearchEngine:
             row = cursor.fetchone()
             if row:
                 result_list.append({
-                    "id"          : row[0],
-                    "subject"     : row[1],
-                    "sender"      : row[2],
+                    "id": row[0],
+                    "subject": row[1],
+                    "sender": row[2],
                     "sender_email": row[3],
-                    "to"          : row[4],
-                    "date"        : row[5],
+                    "to": row[4],
+                    "date": row[5],
                     "body_preview": row[6],
-                    "score"       : scores.get(row[0], 0)
+                    "score": scores.get(row[0], 0)
                 })
         conn.close()
         return result_list
@@ -110,14 +109,14 @@ class SearchEngine:
         result_list = []
         for row in cursor.fetchall():
             result_list.append({
-                "id"          : row[0],
-                "subject"     : row[1],
-                "sender"      : row[2],
+                "id": row[0],
+                "subject": row[1],
+                "sender": row[2],
                 "sender_email": row[3],
-                "to"          : row[4],
-                "date"        : row[5],
+                "to": row[4],
+                "date": row[5],
                 "body_preview": row[6],
-                "score"       : 0
+                "score": 0
             })
         conn.close()
         return result_list
@@ -130,10 +129,16 @@ class SearchEngine:
         conn.close()
         if row:
             return {
-                "id"             : row[0],
-                "subject"        : row[1],
-                "sender"         : row[2],
-                "sender_email"   : row[3],
-                "recipients"     : row[4],
-                "date"           : row[5],
-                "body"           : row[6
+                "id": row[0],
+                "subject": row[1],
+                "sender": row[2],
+                "sender_email": row[3],
+                "recipients": row[4],
+                "date": row[5],
+                "body": row[6],
+                "body_preview": row[7],
+                "folder": row[8],
+                "is_read": row[9],
+                "has_attachments": row[10]
+            }
+        return None
