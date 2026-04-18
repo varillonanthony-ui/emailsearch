@@ -16,7 +16,7 @@ class EmailFetcher:
         self.token = token or self._get_token()
         self.db_path = db_path or config.DB_PATH
         self.user_email = user_email or config.USER_EMAIL
-        
+
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json"
@@ -59,8 +59,9 @@ class EmailFetcher:
         conn.close()
 
     def fetch_all_emails(self, max_emails=5000):
+        # ✅ CORRECTION : utilise /me/ au lieu de /users/{email}
         url = (
-            f"{config.GRAPH_ENDPOINT}/users/{self.user_email}/messages"
+            f"{config.GRAPH_ENDPOINT}/me/messages"
             f"?$top=100"
             f"&$select=id,subject,from,toRecipients,receivedDateTime"
             f",bodyPreview,body,parentFolderId,isRead,hasAttachments"
@@ -71,9 +72,17 @@ class EmailFetcher:
         cursor = conn.cursor()
 
         while url and total < max_emails:
+            print(f"🔄 Fetch: {url[:80]}...")  # DEBUG
             response = requests.get(url, headers=self.headers)
+            
+            if response.status_code != 200:
+                print(f"❌ Erreur API: {response.status_code} - {response.text}")
+                break
+            
             data     = response.json()
             emails   = data.get("value", [])
+            
+            print(f"📧 {len(emails)} emails trouvés dans cette page")  # DEBUG
 
             for email in emails:
                 cursor.execute(
@@ -97,6 +106,9 @@ class EmailFetcher:
 
             conn.commit()
             url = data.get("@odata.nextLink")
+            
+            print(f"✅ Total inséré: {total}, NextLink: {bool(url)}")  # DEBUG
 
         conn.close()
+        print(f"🎉 {total} emails sauvegardés en DB")  # DEBUG
         return total
