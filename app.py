@@ -36,7 +36,7 @@ if "user" not in st.session_state:
     st.markdown("Connectez-vous avec votre compte Microsoft pour accéder à l'application.")
     
     auth_url = get_auth_url()
-    st.link_button("🔑 Se connecter avec Microsoft", auth_url)
+    st.markdown(f'<a href="{auth_url}" target="_self"><button style="background-color:#0078d4;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;font-size:16px;">🔑 Se connecter avec Microsoft</button></a>', unsafe_allow_html=True)
     
     # Récupérer le code de retour
     params = st.query_params
