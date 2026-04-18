@@ -3,6 +3,7 @@ from whoosh import index
 from whoosh.qparser import MultifieldParser
 from whoosh.query import Or
 import config
+from datetime import datetime
 
 class SearchEngine:
 
@@ -18,6 +19,7 @@ class SearchEngine:
     def search(self, query_str, fields=None, limit=50):
         """
         Recherche multi-mots clés avec OR par défaut
+        Résultats triés par date (plus récent en haut)
         """
         if not fields:
             fields = ["subject", "body", "sender"]
@@ -47,7 +49,7 @@ class SearchEngine:
                 else:
                     query = parser.parse(query_str)
                 
-                results = searcher.search(query, limit=limit)
+                results = searcher.search(query, limit=limit * 2)  # ✅ Récupérer plus pour trier
                 ids = [r["id"] for r in results]
                 scores = {r["id"]: r.score for r in results}
         except Exception as e:
@@ -76,11 +78,17 @@ class SearchEngine:
                     "score": scores.get(row[0], 0)
                 })
         conn.close()
-        return result_list
+        
+        # ✅ TRIER PAR DATE (PLUS RÉCENT EN HAUT)
+        result_list.sort(key=lambda x: x["date"] if x["date"] else "", reverse=True)
+        
+        # ✅ Limiter au nombre de résultats demandé
+        return result_list[:limit]
 
     def _search_sqlite(self, query_str, limit=50):
         """
         Fallback : recherche directe dans SQLite avec LIKE
+        Triée par date (plus récent en haut)
         """
         keywords = query_str.split()
         conn = sqlite3.connect(self.db_path)
@@ -97,6 +105,7 @@ class SearchEngine:
         
         where_sql = " OR ".join(where_clauses)
         
+        # ✅ TRIER PAR DATE DESC (PLUS RÉCENT EN HAUT)
         cursor.execute(
             f"""SELECT id, subject, sender, sender_email, recipients, date, body_preview 
                FROM emails 
