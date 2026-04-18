@@ -611,3 +611,65 @@ elif menu == "🔧 Debug":
         st.error(f"❌ Erreur : {e}")
         import traceback
         st.error(traceback.format_exc())
+
+# ===== DEBUG SECTION (à la fin du fichier) =====
+
+st.markdown("---")
+st.markdown("### 🔧 DEBUG - Temporaire")
+
+if st.checkbox("🔍 Afficher les infos de DEBUG"):
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("1️⃣ Chercher le mail en BD")
+        if st.button("📊 Afficher TOUS les mails"):
+            try:
+                # Récupère tous les mails
+                conn = sqlite3.connect("emails.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT subject, sender, body FROM emails LIMIT 100")
+                all_mails = cursor.fetchall()
+                conn.close()
+                
+                st.write(f"**Total mails en BD : {len(all_mails)}**")
+                
+                # Cherche "Lison" et "GLS"
+                found = [m for m in all_mails if "Lison" in str(m[1]) or "Lison" in str(m[2]) or "GLS" in str(m[1]) or "GLS" in str(m[2])]
+                
+                st.write(f"**Mails contenant 'Lison' ou 'GLS' : {len(found)}**")
+                
+                if found:
+                    st.success("✅ Le mail EXISTE en BD !")
+                    for mail in found[:3]:  # Affiche les 3 premiers
+                        st.write(f"👤 **Sender:** {mail[1]}")
+                        st.write(f"📌 **Subject:** {mail[0]}")
+                        st.write(f"📄 **Body preview:** {mail[2][:200]}...")
+                        st.divider()
+                else:
+                    st.error("❌ Le mail n'existe PAS en BD !")
+                    
+            except Exception as e:
+                st.error(f"Erreur : {e}")
+    
+    with col2:
+        st.subheader("2️⃣ Tester la recherche")
+        if st.button("🔎 Tester recherche 'Lison GLS'"):
+            try:
+                # Utilise la fonction search existante
+                from search_engine import SearchEngine
+                engine = SearchEngine()
+                results = engine.search("Lison GLS", limit=100)
+                
+                st.write(f"**Résultats trouvés : {len(results)}**")
+                
+                if results:
+                    st.success("✅ La recherche fonctionne !")
+                    for r in results[:3]:
+                        st.write(f"📌 {r['subject']} | {r['sender']}")
+                else:
+                    st.error("❌ Aucun résultat même si le mail existe en BD !")
+                    st.info("💡 Problème d'indexation Whoosh probablement")
+                    
+            except Exception as e:
+                st.error(f"Erreur : {e}")
