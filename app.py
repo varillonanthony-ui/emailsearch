@@ -19,7 +19,8 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # ── SESSION STATE ─────────────────────────────────────────────
 for k, v in [("token", None), ("device_flow", None), ("msal_app", None),
-             ("msal_cache", None), ("token_cache", None)]:
+             ("msal_cache", None), ("token_cache", None),
+             ("live_expanded", {}), ("live_results", None), ("live_query_done", "")]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -144,8 +145,7 @@ FOLDER_OPTIONS = {
 }
 
 def search_emails_api(token, query, folder_key):
-    # On demande aussi le body pour filtrer dedans
-    select = "$select=subject,from,receivedDateTime,bodyPreview,isRead,toRecipients,body"
+    select = "$select=subject,from,receivedDateTime,bodyPreview,isRead,toRecipients,body,id"
     if folder_key == "all":
         endpoint = f"/me/messages?$search=\"{query}\"&$top=999&{select}"
     else:
@@ -153,14 +153,12 @@ def search_emails_api(token, query, folder_key):
     return graph_get_all_pages(token, endpoint)
 
 def highlight_keywords(text, keywords):
-    """Surligne les mots-clés en orange dans un texte markdown."""
     for kw in keywords:
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
         text = pattern.sub(lambda m: f"**:orange[{m.group(0)}]**", text)
     return text
 
 def highlight_keywords_html(text, keywords):
-    """Surligne les mots-clés dans du HTML."""
     for kw in keywords:
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
         text = pattern.sub(
@@ -170,7 +168,6 @@ def highlight_keywords_html(text, keywords):
     return text
 
 def email_matches(email, keywords):
-    """Vérifie que TOUS les mots-clés sont présents dans l'email."""
     subject  = (email.get("subject") or "").lower()
     preview  = (email.get("bodyPreview") or "").lower()
     body_raw = email.get("body", {})
@@ -253,8 +250,8 @@ if menu == "🔍 Recherche":
                 engine   = SearchEngine()
                 keywords = [kw.strip() for kw in query.split() if kw.strip()]
 
-                all_sets         = []
-                all_results_map  = {}
+                all_sets        = []
+                all_results_map = {}
                 for keyword in keywords:
                     res = engine.search(keyword, fields=search_in)
                     all_sets.append(set(r['id'] for r in res))
@@ -304,76 +301,100 @@ if menu == "🔍 Recherche":
 
     # ── RECHERCHE LIVE API ────────────────────────────────────
     with tab_live:
+        st.caption("💡 Entrez plusieurs mots séparés par des espaces : **tous** doivent être présents dans l'email.")
+
         col1, col2, col3 = st.columns([3, 2, 1])
         with col1:
-            live_query = st.text_input("Mot-clé", placeholder="Entrez un mot-clé...", key="live_q")
+            live_query = st.text_input(
+                "Mots-clés",
+                placeholder="Ex: facture janvier dupont",
+                key="live_q"
+            )
         with col2:
             folder_label = st.selectbox("📂 Dossier", list(FOLDER_OPTIONS.keys()))
         with col3:
             st.markdown("<br>", unsafe_allow_html=True)
             search_btn = st.button("Rechercher", type="primary", use_container_width=True)
 
+        # Lance la recherche et stocke les résultats en session
         if search_btn and live_query:
             folder_key    = FOLDER_OPTIONS[folder_label]
             keywords_list = [kw.strip().lower() for kw in live_query.split() if kw.strip()]
 
             with st.spinner(f"Recherche dans « {folder_label} »..."):
                 try:
-                    emails = search_emails_api(token, live_query, folder_key)
-
-                    # ── FILTRE CLIENT ─────────────────────────────────
+                    emails   = search_emails_api(token, live_query, folder_key)
                     filtered = [e for e in emails if email_matches(e, keywords_list)]
-
-                    if not filtered:
-                        st.info("Aucun email ne contient vraiment ce mot-clé.")
-                        st.caption(f"(L'API avait retourné {len(emails)} résultats, tous écartés)")
-                    else:
-                        st.success(f"✅ {len(filtered)} email(s) trouvé(s) dans {folder_label}")
-                        if len(filtered) < len(emails):
-                            st.caption(
-                                f"ℹ️ {len(emails) - len(filtered)} email(s) écartés car "
-                                f"le mot-clé n'y apparaissait pas réellement."
-                            )
-                        st.markdown("---")
-
-                        for email in filtered:
-                            subject     = email.get("subject", "(sans objet)")
-                            sender      = email.get("from", {}).get("emailAddress", {})
-                            sender_name = sender.get("name", "")
-                            sender_addr = sender.get("address", "")
-                            date        = email.get("receivedDateTime", "")[:10]
-                            preview     = email.get("bodyPreview", "")
-                            is_read     = email.get("isRead", True)
-                            unread      = "🔵 " if not is_read else ""
-                            to_list     = email.get("toRecipients", [])
-                            to_str      = ", ".join([
-                                r.get("emailAddress", {}).get("address", "")
-                                for r in to_list
-                            ])
-
-                            # Surligner le mot-clé dans le preview
-                            preview_hl = highlight_keywords(preview, keywords_list)
-
-                            with st.expander(f"{unread}📧 **{subject}** — {sender_name} ({date})"):
-                                st.markdown(f"**De :** {sender_name} <{sender_addr}>")
-                                if to_str:
-                                    st.markdown(f"**À :** {to_str}")
-                                st.markdown(f"**Date :** {date}")
-                                st.markdown(f"**Aperçu :** {preview_hl}")
-
-                                # Bouton pour voir le body complet
-                                if st.button("Voir email complet", key=f"live_{email.get('id', '')}"):
-                                    body_raw     = email.get("body", {})
-                                    body_content = body_raw.get("content", "") if isinstance(body_raw, dict) else ""
-                                    body_hl      = highlight_keywords_html(body_content, keywords_list)
-                                    st.markdown("---")
-                                    st.markdown(body_hl, unsafe_allow_html=True)
-
+                    st.session_state.live_results      = filtered
+                    st.session_state.live_query_done   = live_query
+                    st.session_state.live_total_api    = len(emails)
+                    st.session_state.live_expanded      = {}   # reset les corps ouverts
                 except Exception as e:
                     st.error(f"Erreur : {e}")
+                    st.session_state.live_results = None
 
         elif search_btn:
-            st.warning("Entrez un mot-clé.")
+            st.warning("Entrez au moins un mot-clé.")
+
+        # Affichage des résultats stockés
+        if st.session_state.live_results is not None:
+            filtered      = st.session_state.live_results
+            keywords_list = [kw.strip().lower() for kw in st.session_state.live_query_done.split() if kw.strip()]
+            total_api     = st.session_state.get("live_total_api", 0)
+
+            if not filtered:
+                st.info("Aucun email ne contient vraiment ces mots-clés.")
+                st.caption(f"(L'API avait retourné {total_api} résultats, tous écartés)")
+            else:
+                st.success(f"✅ {len(filtered)} email(s) trouvé(s)")
+                if len(filtered) < total_api:
+                    st.caption(
+                        f"ℹ️ {total_api - len(filtered)} email(s) écartés car "
+                        f"les mots-clés n'y apparaissaient pas réellement."
+                    )
+                if keywords_list:
+                    st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords_list)}")
+                st.markdown("---")
+
+                for idx, email in enumerate(filtered):
+                    email_id    = email.get("id", str(idx))
+                    subject     = email.get("subject", "(sans objet)")
+                    sender      = email.get("from", {}).get("emailAddress", {})
+                    sender_name = sender.get("name", "")
+                    sender_addr = sender.get("address", "")
+                    date        = email.get("receivedDateTime", "")[:10]
+                    preview     = email.get("bodyPreview", "")
+                    is_read     = email.get("isRead", True)
+                    unread      = "🔵 " if not is_read else ""
+                    to_list     = email.get("toRecipients", [])
+                    to_str      = ", ".join([
+                        r.get("emailAddress", {}).get("address", "")
+                        for r in to_list
+                    ])
+                    preview_hl  = highlight_keywords(preview, keywords_list)
+
+                    with st.expander(f"{unread}📧 **{subject}** — {sender_name} ({date})"):
+                        st.markdown(f"**De :** {sender_name} <{sender_addr}>")
+                        if to_str:
+                            st.markdown(f"**À :** {to_str}")
+                        st.markdown(f"**Date :** {date}")
+                        st.markdown(f"**Aperçu :** {preview_hl}")
+
+                        # Bouton "Voir email complet" — stocke l'état dans session_state
+                        btn_key = f"live_open_{email_id}"
+                        if st.session_state.live_expanded.get(email_id):
+                            body_raw     = email.get("body", {})
+                            body_content = body_raw.get("content", "") if isinstance(body_raw, dict) else ""
+                            body_hl      = highlight_keywords_html(body_content, keywords_list)
+                            st.markdown("---")
+                            st.components.v1.html(body_hl, height=500, scrolling=True)
+                            if st.button("🔼 Masquer", key=f"hide_{email_id}"):
+                                st.session_state.live_expanded[email_id] = False
+                                st.rerun()
+                        else:
+                            if st.button("📄 Voir email complet", key=btn_key):
+                                st.session_state.live_expanded[email_id] = True
+                                st.rerun()
 
 # ── PAGE STATISTIQUES ─────────────────────────────────────────
 elif menu == "📊 Statistiques":
