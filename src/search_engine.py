@@ -1,9 +1,8 @@
 import sqlite3
 from whoosh import index
 from whoosh.qparser import MultifieldParser
-from whoosh.query import Or
+from whoosh.query import And
 import config
-from datetime import datetime
 
 class SearchEngine:
 
@@ -18,7 +17,7 @@ class SearchEngine:
 
     def search(self, query_str, fields=None, limit=50):
         """
-        Recherche multi-mots clés avec OR par défaut
+        Recherche multi-mots clés avec AND (tous les mots doivent être présents)
         Résultats triés par date (plus récent en haut)
         """
         if not fields:
@@ -32,10 +31,10 @@ class SearchEngine:
             with self.ix.searcher() as searcher:
                 parser = MultifieldParser(fields, self.ix.schema)
                 
-                # ✅ Split les mots et crée une requête OR
+                # ✅ Split les mots et crée une requête AND (tous doivent être présents)
                 keywords = query_str.split()
                 if len(keywords) > 1:
-                    # Créer une requête avec OR entre les mots
+                    # Créer une requête avec AND entre les mots
                     queries = []
                     for keyword in keywords:
                         try:
@@ -43,13 +42,13 @@ class SearchEngine:
                         except:
                             pass
                     if queries:
-                        query = Or(queries)
+                        query = And(queries)  # ✅ CHANGÉ DE Or À And
                     else:
                         query = parser.parse(query_str)
                 else:
                     query = parser.parse(query_str)
                 
-                results = searcher.search(query, limit=limit * 2)  # ✅ Récupérer plus pour trier
+                results = searcher.search(query, limit=limit * 2)
                 ids = [r["id"] for r in results]
                 scores = {r["id"]: r.score for r in results}
         except Exception as e:
@@ -88,22 +87,24 @@ class SearchEngine:
     def _search_sqlite(self, query_str, limit=50):
         """
         Fallback : recherche directe dans SQLite avec LIKE
-        Triée par date (plus récent en haut)
+        ✅ TOUS les mots-clés doivent être présents (AND)
         """
         keywords = query_str.split()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Construire la requête SQL avec OR
+        # ✅ CHANGÉ : Utiliser AND au lieu de OR
+        # Chaque mot-clé doit être présent dans au moins UN champ
         where_clauses = []
-        params = []
-        
         for keyword in keywords:
-            where_clauses.append("(subject LIKE ? OR body LIKE ? OR sender LIKE ? OR sender_email LIKE ? OR recipients LIKE ?)")
-            for _ in range(5):
-                params.append(f"%{keyword}%")
+            where_clauses.append(f"(subject LIKE ? OR body LIKE ? OR sender LIKE ? OR sender_email LIKE ? OR recipients LIKE ?)")
         
-        where_sql = " OR ".join(where_clauses)
+        where_sql = " AND ".join(where_clauses)  # ✅ AND entre les mots
+        
+        params = []
+        for keyword in keywords:
+            for _ in range(5):  # 5 champs à vérifier
+                params.append(f"%{keyword}%")
         
         # ✅ TRIER PAR DATE DESC (PLUS RÉCENT EN HAUT)
         cursor.execute(
