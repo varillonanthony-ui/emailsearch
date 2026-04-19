@@ -170,6 +170,16 @@ class Database:
         cur.execute("DELETE FROM emails_fts WHERE id = ?", (email_id,))
         conn.commit()
 
+    def get_email_ids_for_folder(self, folder_id: str) -> set[str]:
+        """
+        Retourne l'ensemble des IDs d'emails déjà indexés pour un dossier.
+        Utilisé par l'indexeur pour distinguer ajout vs mise à jour en 1 requête SQL
+        (évite le N+1 : pas de get_email_detail() par email dans la boucle de sync).
+        """
+        cur = self._conn_get().cursor()
+        cur.execute("SELECT id FROM emails WHERE folder_id = ?", (folder_id,))
+        return {row["id"] for row in cur.fetchall()}
+
     def get_email_detail(self, email_id: str) -> dict | None:
         """Retourne tous les champs d'un email (dont le corps complet)."""
         cur = self._conn_get().cursor()

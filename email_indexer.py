@@ -1,11 +1,12 @@
 """
-email_indexer.py – Synchronisation des emails Office 365 via Microsoft Graph API.
+email_indexer.py – Synchronisation complète des emails Office 365 via Microsoft Graph API.
 
-Stratégie de synchronisation :
-  • Première sync d'un dossier  → téléchargement complet + stockage du delta token
-  • Syncs suivantes             → delta query : seuls les ajouts/modifications/suppressions
-                                  depuis la dernière sync sont traités
-  • Force full (reset)          → suppression des delta tokens → re-sync complète
+Corrections v3 :
+  • Suppression du N+1 (get_email_detail par email) → chargement bulk des IDs existants
+  • Gestion du 410 Gone (delta token expiré) → fallback automatique en sync complète
+  • Taille de page augmentée à 100 pour réduire les allers-retours API
+  • Découverte exhaustive des dossiers (dossiers système + récursif)
+  • Sauvegarde du delta token UNIQUEMENT à la fin (pas de perte en cas d'interruption)
 """
 
 import time
@@ -23,17 +24,22 @@ MSG_SELECT = (
     "hasAttachments,isRead,importance,conversationId,webLink"
 )
 
+# Dossiers système garantis — couvre Archive, Clutter, etc.
+WELL_KNOWN_FOLDERS = [
+    "inbox", "sentitems", "deleteditems", "drafts",
+    "junkemail", "archive", "clutter", "outbox",
+]
+
 
 @dataclass
 class SyncResult:
-    """Résultat d'une synchronisation avec statistiques détaillées."""
-    total_folders:    int = 0
-    folders_full:     int = 0   # dossiers synchronisés en mode complet (1ère fois)
-    folders_delta:    int = 0   # dossiers synchronisés en mode incrémental
-    emails_new:       int = 0   # emails ajoutés
-    emails_updated:   int = 0   # emails modifiés
-    emails_deleted:   int = 0   # emails supprimés
-    errors:           list[str] = field(default_factory=list)
+    total_folders:  int = 0
+    folders_full:   int = 0
+    folders_delta:  int = 0
+    emails_new:     int = 0
+    emails_updated: int = 0
+    emails_deleted: int = 0
+    errors:         list[str] = field(default_factory=list)
 
     @property
     def emails_total(self) -> int:
@@ -41,87 +47,110 @@ class SyncResult:
 
 
 class EmailIndexer:
-    """Indexe tous les emails d'une boîte Office 365 dans une base SQLite par utilisateur."""
 
     def __init__(self, access_token: str, user_id: str):
         self.db = Database(user_id)
         self._headers = {
             "Authorization": f"Bearer {access_token}",
-            "Prefer": 'outlook.body-content-type="text"',
+            "Prefer":        'outlook.body-content-type="text"',
         }
 
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
     def _get(self, url: str, params: dict | None = None) -> dict:
+        """GET avec retry throttling/5xx. Lève GoneError sur 410."""
         for attempt in range(5):
             try:
-                r = requests.get(url, headers=self._headers, params=params, timeout=30)
-            except requests.RequestException as e:
+                r = requests.get(url, headers=self._headers,
+                                 params=params, timeout=30)
+            except requests.RequestException:
                 if attempt == 4:
                     raise
                 time.sleep(2 ** attempt)
                 continue
 
+            if r.status_code == 410:
+                raise _GoneError("Delta token expiré (410 Gone)")
             if r.status_code == 429:
                 time.sleep(int(r.headers.get("Retry-After", 10)))
                 continue
             if r.status_code == 401:
-                raise PermissionError("Token expiré ou invalide – reconnectez-vous.")
+                raise PermissionError("Token expiré – reconnectez-vous.")
             if r.status_code >= 500:
                 time.sleep(2 ** attempt)
                 continue
             r.raise_for_status()
             return r.json()
 
-        raise RuntimeError(f"Impossible d'accéder à {url} après 5 tentatives.")
+        raise RuntimeError(f"Échec après 5 tentatives : {url}")
 
     # ── Dossiers ──────────────────────────────────────────────────────────────
 
-    def _fetch_folders(self, parent_id: str | None = None, parent_path: str = "") -> list[dict]:
-        url = (
-            f"{GRAPH}/me/mailFolders/{parent_id}/childFolders"
-            if parent_id else f"{GRAPH}/me/mailFolders"
-        )
+    def _fetch_folders(self) -> list[dict]:
+        """
+        Découverte exhaustive des dossiers :
+        1. Dossiers système well-known (inbox, sentitems, archive…)
+        2. Tous les dossiers via /mailFolders (récursif)
+        Déduplique par ID.
+        """
+        seen:    set[str]  = set()
         folders: list[dict] = []
-        params = {"$top": 100}
 
-        while url:
-            data = self._get(url, params if "?" not in url else None)
-            for f in data.get("value", []):
-                path   = f"{parent_path}/{f['displayName']}" if parent_path else f["displayName"]
-                record = {
-                    "id":                f["id"],
-                    "name":              f["displayName"],
-                    "parent_folder_id":  parent_id or "",
-                    "total_item_count":  f.get("totalItemCount", 0),
-                    "unread_item_count": f.get("unreadItemCount", 0),
-                    "display_path":      path,
-                    "last_sync":         None,
-                }
-                folders.append(record)
-                self.db.upsert_folder(record)
-                if f.get("childFolderCount", 0) > 0:
-                    folders.extend(self._fetch_folders(f["id"], path))
-            url    = data.get("@odata.nextLink")
-            params = None
+        def _add(f: dict, path: str, parent_id: str | None):
+            if f["id"] in seen:
+                return
+            seen.add(f["id"])
+            record = {
+                "id":                f["id"],
+                "name":              f["displayName"],
+                "parent_folder_id":  parent_id or "",
+                "total_item_count":  f.get("totalItemCount", 0),
+                "unread_item_count": f.get("unreadItemCount", 0),
+                "display_path":      path,
+                "last_sync":         None,
+            }
+            folders.append(record)
+            self.db.upsert_folder(record)
 
+        # 1. Dossiers système
+        for wk in WELL_KNOWN_FOLDERS:
+            try:
+                f = self._get(f"{GRAPH}/me/mailFolders/{wk}")
+                _add(f, f["displayName"], None)
+            except Exception:
+                pass  # dossier inexistant pour cet utilisateur
+
+        # 2. Parcours récursif complet
+        def _recurse(parent_id: str | None, parent_path: str):
+            url = (
+                f"{GRAPH}/me/mailFolders/{parent_id}/childFolders"
+                if parent_id else f"{GRAPH}/me/mailFolders"
+            )
+            params = {"$top": 100}
+            while url:
+                data = self._get(url, params if "?" not in url else None)
+                for f in data.get("value", []):
+                    path = f"{parent_path}/{f['displayName']}" if parent_path else f["displayName"]
+                    _add(f, path, parent_id)
+                    if f.get("childFolderCount", 0) > 0:
+                        _recurse(f["id"], path)
+                url    = data.get("@odata.nextLink")
+                params = None
+
+        _recurse(None, "")
         return folders
 
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _parse(msg: dict, folder_id: str, folder_name: str) -> dict:
-        addr       = (msg.get("from") or msg.get("sender") or {}).get("emailAddress", {})
-        recipients = "; ".join(
-            r["emailAddress"]["address"]
-            for r in msg.get("toRecipients", [])
-            if r.get("emailAddress", {}).get("address")
-        )
-        cc = "; ".join(
-            r["emailAddress"]["address"]
-            for r in msg.get("ccRecipients", [])
-            if r.get("emailAddress", {}).get("address")
-        )
+        addr = (msg.get("from") or msg.get("sender") or {}).get("emailAddress", {})
+        def _addrs(key):
+            return "; ".join(
+                r["emailAddress"]["address"]
+                for r in msg.get(key, [])
+                if r.get("emailAddress", {}).get("address")
+            )
         return {
             "id":                msg["id"],
             "folder_id":         folder_id,
@@ -129,8 +158,8 @@ class EmailIndexer:
             "subject":           msg.get("subject") or "(Sans objet)",
             "sender_name":       addr.get("name", ""),
             "sender_email":      addr.get("address", ""),
-            "recipients":        recipients,
-            "cc":                cc,
+            "recipients":        _addrs("toRecipients"),
+            "cc":                _addrs("ccRecipients"),
             "body_preview":      msg.get("bodyPreview", ""),
             "body":              (msg.get("body") or {}).get("content", ""),
             "received_datetime": msg.get("receivedDateTime", ""),
@@ -153,109 +182,101 @@ class EmailIndexer:
         on_progress: Callable[[int, int, int], None] | None = None,
     ) -> tuple[bool, int, int, int]:
         """
-        Synchronise un dossier.
+        Retourne (was_incremental, new, updated, deleted).
 
-        Paramètres
-        ----------
-        force_full  : si True, ignore le delta token et re-télécharge tout.
-        on_progress : callback(new, updated, deleted) appelé après chaque batch.
-
-        Retour
-        ------
-        (was_incremental, new, updated, deleted)
+        Stratégie :
+        - Charge en BULK les IDs déjà en base (1 requête SQL) pour
+          distinguer ajout vs mise à jour sans N+1.
+        - Si le delta token a expiré (410), retombe automatiquement en sync complète.
+        - Sauvegarde le delta token UNIQUEMENT quand @odata.deltaLink est reçu
+          (fin réelle de la sync), pas avant.
         """
         delta_key  = f"delta_{folder_id}"
-        delta_link = self.db.get_sync_state(delta_key)
+        delta_link = self.db.get_sync_state(delta_key) if not force_full else None
 
-        # Détermine le mode
-        if force_full or not delta_link:
-            was_incremental = False
-            if force_full and delta_link:
-                self.db.set_sync_state(delta_key, "")   # efface l'ancien delta
-            url = (
-                f"{GRAPH}/me/mailFolders/{folder_id}/messages/delta"
-                f"?$select={MSG_SELECT}&$top=50"
-            )
-        else:
-            was_incremental = True
-            url = delta_link
+        # Nettoie un éventuel token vide laissé par un reset précédent
+        if delta_link == "":
+            delta_link = None
+
+        was_incremental = bool(delta_link)
+        url = delta_link or (
+            f"{GRAPH}/me/mailFolders/{folder_id}/messages/delta"
+            f"?$select={MSG_SELECT}&$top=100"
+        )
+
+        # ── Chargement BULK des IDs existants (1 seule requête) ───────────────
+        # Permet de distinguer new vs updated sans requête par email.
+        existing_ids: set[str] = self.db.get_email_ids_for_folder(folder_id)
 
         new_count     = 0
         updated_count = 0
         deleted_count = 0
         batch: list[dict] = []
+        final_delta: str | None = None
 
-        # IDs déjà en base pour distinguer ajout vs mise à jour
-        existing_ids: set[str] = set()
-        if was_incremental:
-            # En mode delta on ne charge pas tous les IDs (trop coûteux).
-            # On détecte la mise à jour à l'upsert — on considère tout comme "new"
-            # côté comptage local (le delta nous donne uniquement les changements).
-            pass
+        try:
+            while url:
+                data = self._get(url)
 
-        while url:
-            data = self._get(url)
+                for msg in data.get("value", []):
+                    if msg.get("@removed"):
+                        self.db.delete_email(msg["id"])
+                        existing_ids.discard(msg["id"])
+                        deleted_count += 1
+                        continue
 
-            for msg in data.get("value", []):
-                if msg.get("@removed"):
-                    self.db.delete_email(msg["id"])
-                    deleted_count += 1
-                    continue
+                    parsed = self._parse(msg, folder_id, folder_name)
+                    if parsed["id"] in existing_ids:
+                        updated_count += 1
+                    else:
+                        new_count += 1
+                        existing_ids.add(parsed["id"])
+                    batch.append(parsed)
 
-                parsed = self._parse(msg, folder_id, folder_name)
+                    if len(batch) >= 200:
+                        self.db.upsert_emails_batch(batch)
+                        batch = []
+                        if on_progress:
+                            on_progress(new_count, updated_count, deleted_count)
 
-                # Détecte si l'email existe déjà (mise à jour vs ajout)
-                existing = self.db.get_email_detail(parsed["id"])
-                if existing:
-                    updated_count += 1
+                # Fin de la pagination
+                new_delta = data.get("@odata.deltaLink")
+                if new_delta:
+                    final_delta = new_delta
+                    url = None
                 else:
-                    new_count += 1
+                    url = data.get("@odata.nextLink")
 
-                batch.append(parsed)
+        except _GoneError:
+            # Delta token expiré → on recommence en sync complète pour CE dossier
+            if batch:
+                self.db.upsert_emails_batch(batch)
+            # Réinitialise et relance en mode complet
+            self.db.set_sync_state(delta_key, "")
+            return self._sync_folder(folder_id, folder_name,
+                                     force_full=True, on_progress=on_progress)
 
-                if len(batch) >= 100:
-                    self.db.upsert_emails_batch(batch)
-                    batch = []
-                    if on_progress:
-                        on_progress(new_count, updated_count, deleted_count)
-
-            new_delta = data.get("@odata.deltaLink")
-            if new_delta:
-                self.db.set_sync_state(delta_key, new_delta)
-                url = None
-            else:
-                url = data.get("@odata.nextLink")
-
+        # Flush du dernier batch
         if batch:
             self.db.upsert_emails_batch(batch)
 
-        # Horodatage de la dernière sync du dossier
+        # Sauvegarde du delta token (seulement si sync complète reçue)
+        if final_delta:
+            self.db.set_sync_state(delta_key, final_delta)
+
         self.db.set_sync_state(
             f"folder_synced_{folder_id}",
             datetime.utcnow().isoformat()
         )
-
         return was_incremental, new_count, updated_count, deleted_count
 
-    # ── Sync complète / incrémentale ──────────────────────────────────────────
+    # ── Sync complète ─────────────────────────────────────────────────────────
 
     def sync(
         self,
-        force_full:  bool = False,
-        on_status:   Callable[[str, SyncResult], None] | None = None,
+        force_full: bool = False,
+        on_status:  Callable[[str, SyncResult], None] | None = None,
     ) -> SyncResult:
-        """
-        Lance la synchronisation de toute la boîte mail.
-
-        Paramètres
-        ----------
-        force_full : False  → mode incrémental (delta tokens)
-                     True   → réinitialise tous les delta tokens et re-télécharge tout
-
-        Retour
-        ------
-        SyncResult avec le détail des opérations effectuées.
-        """
         result = SyncResult()
 
         if on_status:
@@ -270,12 +291,12 @@ class EmailIndexer:
                 on_status(f"Analyse : {label}", result)
 
             try:
-                incremental, n, u, d = self._sync_folder(
+                inc, n, u, d = self._sync_folder(
                     folder_id=folder["id"],
                     folder_name=folder["name"],
                     force_full=force_full,
-                    on_progress=lambda nw, up, dl, _lbl=label: (
-                        on_status(f"Sync : {_lbl}", result) if on_status else None
+                    on_progress=lambda nw, up, dl, _r=result, _lbl=label: (
+                        on_status(f"Sync : {_lbl}", _r) if on_status else None
                     ),
                 )
             except Exception as e:
@@ -285,18 +306,17 @@ class EmailIndexer:
             result.emails_new     += n
             result.emails_updated += u
             result.emails_deleted += d
-
-            if incremental:
+            if inc:
                 result.folders_delta += 1
             else:
                 result.folders_full  += 1
 
+            if on_status:
+                on_status(f"✓ {label}  (+{n} / ✏{u} / 🗑{d})", result)
+
         self.db.set_sync_state("last_full_sync", datetime.utcnow().isoformat())
         return result
 
-    def reset_and_full_sync(
-        self,
-        on_status: Callable[[str, SyncResult], None] | None = None,
-    ) -> SyncResult:
-        """Raccourci : réinitialise tous les delta tokens et re-sync tout."""
-        return self.sync(force_full=True, on_status=on_status)
+
+class _GoneError(Exception):
+    """Delta token expiré (HTTP 410)."""
