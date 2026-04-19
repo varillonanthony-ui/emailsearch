@@ -235,55 +235,65 @@ class Database:
         "Brouillons", "Drafts",
     )
 
+    # Colonnes dans lesquelles on cherche les mots-clés
+    SEARCH_COLS = ("subject", "sender_name", "sender_email",
+                   "recipients", "body_preview", "body")
+
     def search_emails(
         self,
         keywords: list[str],
-        folder_filter: str = "all",        # "all" | "no_sent_deleted" | "specific"
+        folder_filter: str = "all",
         folder_ids: list[str] | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[dict], int]:
         """
-        Recherche avec logique ET sur tous les mots-clés.
-        Retourne (résultats, total).
+        Recherche LIKE multi-mots-clés avec logique ET stricte.
+
+        Chaque mot-clé doit être présent dans au moins une colonne
+        (sujet, expéditeur, destinataires, aperçu du corps, corps complet).
+        Si UN SEUL mot-clé est absent de toutes les colonnes -> email exclu.
+
+        Utilise LIKE plutôt que FTS5 pour être 100 % fiable :
+        - pas de problème de tokeniseur / accents
+        - correspondances partielles
+        - pas de syntaxe FTS5 à échapper
         """
         conn = self._conn_get()
-        cur = conn.cursor()
+        cur  = conn.cursor()
 
         conditions: list[str] = []
         params: list = []
 
-        # ── Filtrage FTS5 ──────────────────────────────────────────────────────
-        if keywords:
-            # FTS5 MATCH : "mot1" AND "mot2" … (les guillemets gèrent les termes avec espaces)
-            fts_expr = " AND ".join(
-                f'"{kw.strip().replace(chr(34), "")}"'
-                for kw in keywords if kw.strip()
+        # ── Un bloc AND par mot-clé ─────────────────────────────────────────
+        # Pour chaque mot-clé : (col1 LIKE ? OR col2 LIKE ? OR …)
+        # Tous les blocs sont reliés par AND.
+        for kw in keywords:
+            kw = kw.strip()
+            if not kw:
+                continue
+            pattern  = f"%{kw.lower()}%"
+            col_cond = " OR ".join(
+                f"LOWER(e.{col}) LIKE ?" for col in self.SEARCH_COLS
             )
-            if fts_expr:
-                conditions.append(
-                    "e.id IN (SELECT id FROM emails_fts WHERE emails_fts MATCH ?)"
-                )
-                params.append(fts_expr)
+            conditions.append(f"({col_cond})")
+            params.extend([pattern] * len(self.SEARCH_COLS))
 
-        # ── Filtre dossiers ────────────────────────────────────────────────────
+        # ── Filtre dossiers ─────────────────────────────────────────────────
         if folder_filter == "no_sent_deleted":
-            placeholders = ",".join("?" * len(self.EXCLUDED_FOLDER_NAMES))
-            conditions.append(f"e.folder_name NOT IN ({placeholders})")
+            ph = ",".join("?" * len(self.EXCLUDED_FOLDER_NAMES))
+            conditions.append(f"e.folder_name NOT IN ({ph})")
             params.extend(self.EXCLUDED_FOLDER_NAMES)
-
         elif folder_filter == "specific" and folder_ids:
-            placeholders = ",".join("?" * len(folder_ids))
-            conditions.append(f"e.folder_id IN ({placeholders})")
+            ph = ",".join("?" * len(folder_ids))
+            conditions.append(f"e.folder_id IN ({ph})")
             params.extend(folder_ids)
 
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        # Total
         cur.execute(f"SELECT COUNT(*) AS cnt FROM emails e {where}", params)
         total = cur.fetchone()["cnt"]
 
-        # Résultats paginés
         cur.execute(f"""
             SELECT e.id, e.folder_id, e.folder_name, e.subject,
                    e.sender_name, e.sender_email, e.recipients,
@@ -296,8 +306,7 @@ class Database:
             LIMIT ? OFFSET ?
         """, params + [limit, offset])
 
-        results = [dict(r) for r in cur.fetchall()]
-        return results, total
+        return [dict(r) for r in cur.fetchall()], total
 
     # ── Statistiques ──────────────────────────────────────────────────────────
 

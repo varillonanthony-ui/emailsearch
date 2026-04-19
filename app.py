@@ -184,11 +184,6 @@ def highlight_keywords(text, keywords):
 # ── Synchronisation ───────────────────────────────────────────────────────────
 
 def run_sync(access_token: str, user_id: str, force_full: bool = False):
-    """
-    Lance la synchronisation.
-    force_full=False → incrémentale (delta tokens, seuls les changements)
-    force_full=True  → complète (réinitialise les delta tokens, tout re-télécharge)
-    """
     from email_indexer import SyncResult
 
     mode_label = "Synchronisation complète" if force_full else "Synchronisation incrémentale"
@@ -196,14 +191,14 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
 
     if not force_full:
         st.info(
-            "⚡ **Mode incrémental** : seuls les emails nouveaux, modifiés ou supprimés "
-            "depuis la dernière synchronisation sont traités. Les emails déjà indexés "
-            "sont conservés tels quels."
+            "⚡ **Mode incrémental** — seuls les emails **nouveaux, modifiés ou supprimés** "
+            "depuis la dernière sync sont traités. Les dossiers déjà indexés sans changement "
+            "sont sautés instantanément."
         )
     else:
         st.warning(
-            "🔁 **Mode complet** : tous les delta tokens sont réinitialisés. "
-            "L'intégralité de la boîte mail va être re-téléchargée et réindexée."
+            "🔁 **Mode complet** — tous les delta tokens sont réinitialisés. "
+            "Toute la boîte sera re-téléchargée. Cela peut prendre plusieurs minutes."
         )
 
     status_ph = st.empty()
@@ -213,47 +208,42 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
     del_ph    = cols[2].empty()
     fold_ph   = cols[3].empty()
     progress  = st.progress(0.0)
+    log_ph    = st.empty()
+    log_lines: list[str] = []
 
     indexer = EmailIndexer(access_token, user_id)
-    result  = SyncResult()
 
     def on_status(msg: str, r: SyncResult):
-        nonlocal result
-        result = r
         status_ph.info(f"📬 {msg}")
-        new_ph.metric("🆕 Nouveaux",   f"{r.emails_new:,}")
-        upd_ph.metric("✏️ Modifiés",   f"{r.emails_updated:,}")
-        del_ph.metric("🗑️ Supprimés",  f"{r.emails_deleted:,}")
-        fold_ph.metric("📁 Dossiers",
-                       f"{r.folders_delta + r.folders_full}/{r.total_folders}")
+        new_ph.metric("🆕 Nouveaux",    f"{r.emails_new:,}")
+        upd_ph.metric("✏️ Modifiés",    f"{r.emails_updated:,}")
+        del_ph.metric("🗑️ Supprimés",   f"{r.emails_deleted:,}")
+        done = r.folders_done + r.folders_skip
+        fold_ph.metric("📁 Dossiers",   f"{done}/{r.total_folders}")
         if r.total_folders:
-            progress.progress(
-                min((r.folders_delta + r.folders_full) / r.total_folders, 1.0)
-            )
+            progress.progress(min(done / r.total_folders, 1.0))
+        # Journal déroulant (dernières 8 lignes)
+        log_lines.append(msg)
+        log_ph.code("\n".join(log_lines[-8:]))
 
     try:
         result = indexer.sync(force_full=force_full, on_status=on_status)
         progress.progress(1.0)
+        log_ph.empty()
 
-        # Résumé final
         parts = []
         if result.emails_new:
-            parts.append(f"**{result.emails_new:,}** nouveaux emails")
+            parts.append(f"**{result.emails_new:,}** nouveaux")
         if result.emails_updated:
             parts.append(f"**{result.emails_updated:,}** mis à jour")
         if result.emails_deleted:
             parts.append(f"**{result.emails_deleted:,}** supprimés")
+        if result.folders_skip:
+            parts.append(f"**{result.folders_skip}** dossier(s) déjà à jour (sautés)")
         if not parts:
             parts = ["aucun changement détecté"]
 
-        inc_info = (
-            f"{result.folders_delta} dossier(s) en mode incrémental, "
-            f"{result.folders_full} en mode complet"
-        )
-        st.success(
-            f"✅ **{mode_label} terminée** — {', '.join(parts)}. "
-            f"({inc_info})"
-        )
+        st.success(f"✅ **{mode_label} terminée** — {', '.join(parts)}")
 
         if result.errors:
             with st.expander(f"⚠️ {len(result.errors)} erreur(s) non bloquante(s)"):
@@ -265,11 +255,13 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
         st.rerun()
 
     except PermissionError as e:
-        st.error(str(e))
+        st.error(f"🔑 {e}")
         for k in ["user_info", "access_token", "refresh_token"]:
             st.session_state.pop(k, None)
     except Exception as e:
-        st.error(f"Erreur de synchronisation : {e}")
+        st.error(f"❌ Erreur de synchronisation : {e}")
+        st.caption("Les dossiers déjà terminés sont sauvegardés. "
+                   "Relancez une sync incrémentale pour reprendre.")
         st.session_state.pop("show_sync", None)
         st.session_state.pop("sync_force_full", None)
 
