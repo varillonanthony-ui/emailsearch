@@ -128,6 +128,56 @@ class EmailIndexer:
             pass
         return ""
 
+    def list_attachments(self, email_id: str) -> list[dict]:
+        """
+        Liste les PJ d'un email (métadonnées uniquement, sans téléchargement).
+        Exclut les images inline déjà intégrées dans le corps HTML.
+        """
+        try:
+            r = requests.get(
+                f"{GRAPH}/me/messages/{email_id}/attachments",
+                headers=self._headers,
+                params={"$select": "id,name,contentType,size,isInline"},
+                timeout=30,
+            )
+            if r.ok:
+                return [
+                    {
+                        "id":          a["id"],
+                        "name":        a.get("name", "Sans nom"),
+                        "contentType": a.get("contentType", "application/octet-stream"),
+                        "size":        a.get("size", 0),
+                        "isInline":    a.get("isInline", False),
+                    }
+                    for a in r.json().get("value", [])
+                    if not a.get("isInline", False)
+                ]
+        except Exception:
+            pass
+        return []
+
+    def get_attachment_content(self, email_id: str, attachment_id: str) -> tuple[str, str]:
+        """
+        Récupère le contenu base64 d'une PJ via Graph API.
+        Les octets ne transitent JAMAIS par le disque utilisateur :
+        Graph → base64 → mémoire Python → rendu navigateur.
+        Retourne (base64_string, content_type).
+        """
+        try:
+            r = requests.get(
+                f"{GRAPH}/me/messages/{email_id}/attachments/{attachment_id}",
+                headers=self._headers,
+                params={"$select": "contentBytes,contentType,name"},
+                timeout=60,
+            )
+            if r.ok:
+                data = r.json()
+                return data.get("contentBytes", ""), data.get("contentType", "")
+        except Exception:
+            pass
+        return "", ""
+
+
     # ── Dossiers ──────────────────────────────────────────────────────────────
 
     def _fetch_folders(self) -> list[dict]:
