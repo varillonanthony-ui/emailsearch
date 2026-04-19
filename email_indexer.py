@@ -105,19 +105,25 @@ class EmailIndexer:
     # ── Corps à la demande ────────────────────────────────────────────────────
 
     def get_email_body(self, email_id: str) -> str:
-        """Télécharge le corps d'un email unique (appelé depuis l'UI)."""
+        """
+        Télécharge le corps HTML d'un email (appelé à la demande depuis l'UI).
+        Retourne le HTML brut tel que renvoyé par Outlook.
+        """
         try:
             r = requests.get(
                 f"{GRAPH}/me/messages/{email_id}",
                 headers={
                     **self._headers,
-                    "Prefer": 'outlook.body-content-type="text"',
+                    # Demande le corps en HTML (format natif Outlook)
+                    "Prefer": 'outlook.body-content-type="html"',
                 },
                 params={"$select": "body"},
                 timeout=30,
             )
             if r.ok:
-                return _clean(r.json().get("body", {}).get("content", ""))
+                data    = r.json()
+                content = data.get("body", {}).get("content", "")
+                return content.replace("", "") if content else ""
         except Exception:
             pass
         return ""

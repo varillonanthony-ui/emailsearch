@@ -360,21 +360,61 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=Non
 
             if st.button("📄 Contenu complet", key=f"full_{tab_key}_{email['id']}"):
                 full = db.get_email_detail(email["id"])
-                body = full.get("body", "") if full else ""
+                body = (full.get("body") or "") if full else ""
                 if not body:
-                    # Corps non stocké lors de la sync bulk → chargement à la demande
                     token = get_access_token()
+                    uid   = user_id or st.session_state.get("user_info", {}).get("id", "x")
                     if token:
                         with st.spinner("Chargement du corps…"):
                             from email_indexer import EmailIndexer as _EI
-                            body = _EI(token, user_id or st.session_state.get('user_info',{}).get('id','x')).get_email_body(email["id"])
+                            body = _EI(token, uid).get_email_body(email["id"])
                             if body and full:
-                                # Mise en cache en base pour les prochaines fois
                                 full["body"] = body
                                 db.upsert_email(dict(full))
+
                 if body:
-                    st.text_area("Corps complet", body, height=350,
-                                 key=f"body_{tab_key}_{email['id']}")
+                    import streamlit.components.v1 as _components
+
+                    # Injection CSS pour forcer un rendu propre et sécurisé :
+                    # • box-sizing reset, police système
+                    # • images limitées à 100% de largeur
+                    # • liens s'ouvrent dans un nouvel onglet
+                    safe_html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base target="_blank">
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{
+    margin: 12px 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #1a1a1a;
+    background: #ffffff;
+    word-break: break-word;
+  }}
+  img  {{ max-width: 100%; height: auto; }}
+  a    {{ color: #0078d4; }}
+  pre, code {{ white-space: pre-wrap; word-break: break-all; }}
+  blockquote {{
+    margin: 8px 0 8px 16px;
+    padding-left: 12px;
+    border-left: 3px solid #ccc;
+    color: #555;
+  }}
+  table {{ border-collapse: collapse; max-width: 100%; }}
+  td, th {{ padding: 4px 8px; border: 1px solid #ddd; }}
+</style>
+</head>
+<body>{body}</body>
+</html>"""
+
+                    # Rendu dans un iframe sandboxé (pas de scripts externes)
+                    _components.html(safe_html, height=600, scrolling=True)
                 else:
                     st.info("Corps non disponible. Ouvrez l'email dans Outlook.")
 
