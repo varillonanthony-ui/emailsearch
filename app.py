@@ -129,11 +129,33 @@ def page_login():
         )
         st.markdown("<br>", unsafe_allow_html=True)
         auth_url = get_auth_url()
-        st.markdown(
-            f'<a href="{auth_url}" target="_self" class="ms-btn">'
-            f'🔐 &nbsp; Se connecter avec Microsoft</a>',
-            unsafe_allow_html=True,
+
+        # ── Fix iframe Streamlit Cloud ─────────────────────────────────────────
+        # Microsoft bloque les redirections OAuth dans les iframes (X-Frame-Options).
+        # Streamlit Cloud sert l'app dans un iframe → window.top.location force
+        # la navigation au niveau racine du navigateur, contournant ce blocage.
+        import streamlit.components.v1 as components
+        components.html(
+            f"""
+            <style>
+              body {{ margin:0; padding:0; background:transparent; }}
+              .ms-btn {{
+                display:block; width:100%; padding:13px 0; text-align:center;
+                background:#0078d4; color:#fff; border:none; border-radius:6px;
+                font-size:15px; font-weight:600; cursor:pointer;
+                font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+                text-decoration:none; transition:background .2s;
+              }}
+              .ms-btn:hover {{ background:#106ebe; }}
+            </style>
+            <a class="ms-btn" href="{auth_url}"
+               onclick="window.top.location.href='{auth_url}'; return false;">
+              🔐 &nbsp; Se connecter avec Microsoft
+            </a>
+            """,
+            height=55,
         )
+
         st.markdown("<br>", unsafe_allow_html=True)
         st.caption(
             "🔒 Seuls les comptes du tenant Microsoft configuré peuvent accéder à cette application. "
