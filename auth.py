@@ -21,7 +21,8 @@ AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = [
     "https://graph.microsoft.com/Mail.Read",
     "https://graph.microsoft.com/User.Read",
-    "offline_access",
+    # Note : "offline_access", "openid", "profile" sont réservés par MSAL
+    # et ajoutés automatiquement — ne pas les passer explicitement.
 ]
 
 
