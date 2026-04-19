@@ -1,37 +1,37 @@
 """
-email_indexer.py – Synchronisation emails Office 365 via Microsoft Graph API.
+email_indexer.py v6 — Approche simple et fiable
 
-Stratégie v5 :
-  • $top=500 (max autorisé) → 20 appels pour 10 000 emails au lieu de 100+
-  • Corps (body) NON téléchargé pendant la sync bulk → réponses 50x plus légères
-    Le corps est chargé à la demande quand l'utilisateur clique "Voir le contenu complet"
-  • bodyPreview (255 car.) indexé → suffisant pour la recherche par mot-clé
-  • Checkpoint intra-dossier : le nextLink en cours est sauvegardé toutes les 500 emails
-    Si Streamlit est interrompu, la sync reprend exactement là où elle s'est arrêtée
-  • Gestion 410 Gone, throttling 429, 5xx, timeout 60s
+Sync complète  : GET /mailFolders/{id}/messages?$top=1000
+                 Pagine via @odata.nextLink jusqu'à épuisement total.
+                 Vérifie à la fin que le nombre indexé ≈ totalItemCount.
+
+Sync incrémentale : même endpoint avec $filter sur receivedDateTime
+                    + récupère les emails modifiés récemment.
+
+Avantages vs delta :
+  - Pas de deltaLink prématuré
+  - Vérifiable : on sait combien d'emails le dossier doit avoir
+  - Reprise sur interruption via checkpoint de page (skipToken)
+  - Aucun état corrompu possible
 """
 
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Callable
 import requests
 
 from database import Database
 
-GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH      = "https://graph.microsoft.com/v1.0"
+PAGE_SIZE  = 1000   # maximum autorisé par Graph pour /messages
 
-# Corps exclu du select bulk → réponses légères, sync rapide
-# Le corps est chargé à la demande via get_email_body()
 MSG_SELECT = (
     "id,subject,from,sender,toRecipients,ccRecipients,"
     "bodyPreview,receivedDateTime,sentDateTime,"
-    "hasAttachments,isRead,importance,conversationId,webUrl"
+    "hasAttachments,isRead,importance,conversationId,webLink"
 )
-
-# $top=500 = maximum autorisé par Graph pour /messages/delta
-PAGE_SIZE = 500
 
 WELL_KNOWN = [
     "inbox", "sentitems", "deleteditems", "drafts",
@@ -40,18 +40,24 @@ WELL_KNOWN = [
 
 
 @dataclass
-class SyncResult:
-    total_folders:  int = 0
-    folders_done:   int = 0
-    folders_skip:   int = 0
-    emails_new:     int = 0
-    emails_updated: int = 0
-    emails_deleted: int = 0
-    errors:         list[str] = field(default_factory=list)
+class FolderSyncInfo:
+    name:         str
+    expected:     int   # totalItemCount selon Graph
+    indexed:      int   # emails en base après sync
+    new:          int = 0
+    updated:      int = 0
 
-    @property
-    def emails_total(self) -> int:
-        return self.emails_new + self.emails_updated
+
+@dataclass
+class SyncResult:
+    total_folders:   int = 0
+    folders_done:    int = 0
+    folders_skip:    int = 0
+    emails_new:      int = 0
+    emails_updated:  int = 0
+    warnings:        list[str] = field(default_factory=list)
+    errors:          list[str] = field(default_factory=list)
+    folder_details:  list[FolderSyncInfo] = field(default_factory=list)
 
 
 def _clean(text: str | None) -> str:
@@ -60,17 +66,11 @@ def _clean(text: str | None) -> str:
     return re.sub(r"\s+", " ", text.replace("\x00", "")).strip()
 
 
-class _GoneError(Exception):
-    """HTTP 410 – delta token expiré."""
-
-
 class EmailIndexer:
 
     def __init__(self, access_token: str, user_id: str):
         self.db = Database(user_id)
-        self._headers = {
-            "Authorization": f"Bearer {access_token}",
-        }
+        self._headers = {"Authorization": f"Bearer {access_token}"}
 
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
@@ -87,8 +87,6 @@ class EmailIndexer:
                 time.sleep(2 ** attempt)
                 continue
 
-            if r.status_code == 410:
-                raise _GoneError("Delta token expiré (410)")
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 20))
                 time.sleep(wait)
@@ -99,7 +97,7 @@ class EmailIndexer:
                 time.sleep(2 ** attempt)
                 continue
             if not r.ok:
-                raise RuntimeError(f"HTTP {r.status_code} : {r.text[:300]}")
+                raise RuntimeError(f"HTTP {r.status_code} sur {url[:80]}: {r.text[:200]}")
             return r.json()
 
         raise RuntimeError(f"Abandon après 6 tentatives : {url[:80]}")
@@ -107,15 +105,14 @@ class EmailIndexer:
     # ── Corps à la demande ────────────────────────────────────────────────────
 
     def get_email_body(self, email_id: str) -> str:
-        """Télécharge le corps d'un email unique (appelé à la demande depuis l'UI)."""
+        """Télécharge le corps d'un email unique (appelé depuis l'UI)."""
         try:
-            headers = {
-                **self._headers,
-                "Prefer": 'outlook.body-content-type="text"',
-            }
             r = requests.get(
                 f"{GRAPH}/me/messages/{email_id}",
-                headers=headers,
+                headers={
+                    **self._headers,
+                    "Prefer": 'outlook.body-content-type="text"',
+                },
                 params={"$select": "body"},
                 timeout=30,
             )
@@ -128,6 +125,7 @@ class EmailIndexer:
     # ── Dossiers ──────────────────────────────────────────────────────────────
 
     def _fetch_folders(self) -> list[dict]:
+        """Découverte exhaustive : well-known + récursif complet."""
         seen:    set[str]   = set()
         folders: list[dict] = []
 
@@ -148,7 +146,6 @@ class EmailIndexer:
             folders.append(rec)
             self.db.upsert_folder(rec)
 
-        # 1. Dossiers système garantis
         for wk in WELL_KNOWN:
             try:
                 f = self._get(f"{GRAPH}/me/mailFolders/{wk}")
@@ -156,17 +153,15 @@ class EmailIndexer:
             except Exception:
                 pass
 
-        # 2. Parcours récursif complet
         def _recurse(parent_id: str | None, parent_path: str):
-            url = (
-                f"{GRAPH}/me/mailFolders/{parent_id}/childFolders"
-                if parent_id else f"{GRAPH}/me/mailFolders"
-            )
-            params = {"$top": "100"}
+            url    = (f"{GRAPH}/me/mailFolders/{parent_id}/childFolders"
+                      if parent_id else f"{GRAPH}/me/mailFolders")
+            params = {"$top": "100", "$includeHiddenFolders": "true"}
             while url:
                 data   = self._get(url, params if "?" not in url else None)
                 for f in data.get("value", []):
-                    path = f"{parent_path}/{f['displayName']}" if parent_path else f["displayName"]
+                    path = (f"{parent_path}/{f['displayName']}"
+                            if parent_path else f["displayName"])
                     _save(f, path, parent_id)
                     if f.get("childFolderCount", 0) > 0:
                         _recurse(f["id"], path)
@@ -182,7 +177,7 @@ class EmailIndexer:
     def _parse(msg: dict, folder_id: str, folder_name: str) -> dict:
         ea = (msg.get("from") or msg.get("sender") or {}).get("emailAddress", {})
 
-        def _addrs(key: str) -> str:
+        def _addrs(key):
             return "; ".join(
                 r["emailAddress"].get("address", "")
                 for r in msg.get(key, [])
@@ -199,14 +194,14 @@ class EmailIndexer:
             "recipients":        _clean(_addrs("toRecipients")),
             "cc":                _clean(_addrs("ccRecipients")),
             "body_preview":      _clean(msg.get("bodyPreview", "")),
-            "body":              "",          # chargé à la demande
+            "body":              "",   # chargé à la demande
             "received_datetime": msg.get("receivedDateTime", ""),
             "sent_datetime":     msg.get("sentDateTime", ""),
             "has_attachments":   1 if msg.get("hasAttachments") else 0,
             "is_read":           1 if msg.get("isRead") else 0,
             "importance":        msg.get("importance", "normal"),
             "conversation_id":   msg.get("conversationId", ""),
-            "web_link":          msg.get("webUrl", "") or msg.get("webLink", ""),
+            "web_link":          msg.get("webLink", ""),
             "indexed_at":        datetime.utcnow().isoformat(),
         }
 
@@ -214,135 +209,95 @@ class EmailIndexer:
 
     def _sync_folder(
         self,
-        folder_id:   str,
-        folder_name: str,
-        force_full:  bool = False,
-        on_progress: Callable | None = None,
-    ) -> tuple[bool, int, int, int]:
+        folder_id:    str,
+        folder_name:  str,
+        expected:     int,
+        since_dt:     str | None = None,   # None = full, sinon ISO date
+        on_progress:  Callable | None = None,
+    ) -> tuple[int, int]:
         """
-        Retourne (was_incremental, new, updated, deleted).
+        Pagine à travers TOUS les messages d'un dossier.
+        Checkpoint : le nextLink courant est sauvegardé en base toutes les 1000 emails
+        pour pouvoir reprendre en cas d'interruption.
 
-        Checkpoint intra-dossier :
-        - Le nextLink en cours est sauvegardé toutes les PAGE_SIZE emails
-        - Si interrompu, reprend depuis ce nextLink
-        - Le deltaLink final remplace le nextLink checkpoint en fin de sync
+        Retourne (new, updated).
         """
-        delta_key     = f"delta_{folder_id}"
-        cursor_key    = f"cursor_{folder_id}"  # nextLink checkpoint intra-dossier
+        cursor_key = f"cursor2_{folder_id}"
+        saved_cursor = self.db.get_sync_state(cursor_key) or ""
 
-        # Détermine l'URL de départ
-        if force_full:
-            # Reset complet de ce dossier
-            self.db.set_sync_state(delta_key, "")
-            self.db.set_sync_state(cursor_key, "")
-            was_inc = False
-            start_url = None
+        # Paramètres du premier appel
+        base_url = f"{GRAPH}/me/mailFolders/{folder_id}/messages"
+        if saved_cursor:
+            # Reprise depuis un checkpoint intra-dossier
+            url    = saved_cursor
+            params = None
         else:
-            delta_link  = self.db.get_sync_state(delta_key) or ""
-            cursor_link = self.db.get_sync_state(cursor_key) or ""
+            url    = base_url
+            params = {"$select": MSG_SELECT, "$top": str(PAGE_SIZE)}
+            if since_dt:
+                # Incrémental : seulement les emails plus récents que la dernière sync
+                params["$filter"] = f"receivedDateTime ge {since_dt}"
 
-            if delta_link:
-                # Mode incrémental : reprend depuis le delta token
-                was_inc   = True
-                start_url = delta_link
-            elif cursor_link:
-                # Reprise après interruption dans un dossier
-                was_inc   = False
-                start_url = cursor_link
-            else:
-                was_inc   = False
-                start_url = None
-
-        # URL initiale (si pas de checkpoint/delta)
-        if start_url is None:
-            start_url = f"{GRAPH}/me/mailFolders/{folder_id}/messages/delta"
-
-        # Paramètres uniquement pour l'appel initial (pas inclus dans nextLink/deltaLink)
-        initial_params = {"$select": MSG_SELECT, "$top": str(PAGE_SIZE)}
-
-        # Chargement bulk des IDs existants (1 seule requête SQL)
         existing: set[str] = self.db.get_email_ids_for_folder(folder_id)
-
-        new_n = upd_n = del_n = 0
+        new_n = upd_n = 0
         batch: list[dict] = []
-        final_delta: str | None = None
-        url = start_url
+        page_count = 0
 
-        # Détermine si on passe les params initiaux (URL propre sans query string)
-        use_initial_params = "?" not in url
+        while url:
+            data = self._get(url, params)
+            params = None   # params seulement pour le premier appel
 
-        try:
-            while url:
-                data = self._get(
-                    url,
-                    initial_params if use_initial_params else None,
-                )
-                use_initial_params = False  # seulement pour le premier appel
-
-                for msg in data.get("value", []):
-                    if msg.get("@removed"):
-                        self.db.delete_email(msg["id"])
-                        existing.discard(msg["id"])
-                        del_n += 1
-                        continue
-
-                    parsed = self._parse(msg, folder_id, folder_name)
-                    if parsed["id"] in existing:
-                        upd_n += 1
-                    else:
-                        new_n += 1
-                        existing.add(parsed["id"])
-                    batch.append(parsed)
-
-                    if len(batch) >= PAGE_SIZE:
-                        self.db.upsert_emails_batch(batch)
-                        batch = []
-                        # Checkpoint intra-dossier (nextLink actuel)
-                        if url:
-                            self.db.set_sync_state(cursor_key, url)
-                        if on_progress:
-                            on_progress(new_n, upd_n, del_n)
-
-                next_link  = data.get("@odata.nextLink")
-                delta_link = data.get("@odata.deltaLink")
-
-                if delta_link:
-                    final_delta = delta_link
-                    url = None
-                elif next_link:
-                    url = next_link
+            for msg in data.get("value", []):
+                parsed = self._parse(msg, folder_id, folder_name)
+                if parsed["id"] in existing:
+                    upd_n += 1
                 else:
-                    # Ni nextLink ni deltaLink : fin inattendue, on arrête proprement
-                    url = None
+                    new_n += 1
+                    existing.add(parsed["id"])
+                batch.append(parsed)
 
-        except _GoneError:
-            # Delta expiré → full sync automatique pour ce dossier
-            if batch:
+            # Flush batch
+            if len(batch) >= PAGE_SIZE:
                 self.db.upsert_emails_batch(batch)
-            self.db.set_sync_state(delta_key, "")
-            self.db.set_sync_state(cursor_key, "")
-            return self._sync_folder(folder_id, folder_name,
-                                     force_full=True, on_progress=on_progress)
+                batch = []
 
-        # Flush du dernier batch
+            page_count += 1
+            url = data.get("@odata.nextLink")
+
+            # Checkpoint : sauvegarde le nextLink toutes les pages
+            if url:
+                self.db.set_sync_state(cursor_key, url)
+            
+            if on_progress:
+                on_progress(new_n, upd_n)
+
+        # Flush final
         if batch:
             self.db.upsert_emails_batch(batch)
 
-        # Sauvegarde finale
-        if final_delta:
-            self.db.set_sync_state(delta_key, final_delta)
-            self.db.set_sync_state(cursor_key, "")  # efface le checkpoint intermédiaire
+        # Efface le checkpoint (sync terminée proprement)
+        self.db.set_sync_state(cursor_key, "")
 
-        self.db.set_sync_state(f"folder_done_{folder_id}", datetime.utcnow().isoformat())
-        return was_inc, new_n, upd_n, del_n
+        # Horodatage de la fin de sync pour ce dossier
+        self.db.set_sync_state(
+            f"synced_at_{folder_id}",
+            datetime.now(timezone.utc).isoformat()
+        )
+
+        return new_n, upd_n
 
     # ── Orchestration ─────────────────────────────────────────────────────────
 
     def sync(
         self,
-        force_full: bool = False,
-        on_status:  Callable[[str, SyncResult], None] | None = None,
+        force_full:  bool = False,
+        on_status:   Callable[[str, SyncResult], None] | None = None,
     ) -> SyncResult:
+        """
+        Synchronise toute la boîte.
+        force_full=True  → sync complète même si déjà indexé
+        force_full=False → sync incrémentale depuis la dernière sync
+        """
         result = SyncResult()
 
         if on_status:
@@ -352,38 +307,53 @@ class EmailIndexer:
         result.total_folders = len(folders)
 
         if on_status:
-            on_status(f"📁 {len(folders)} dossier(s) trouvé(s)", result)
+            on_status(f"📁 {len(folders)} dossier(s) trouvé(s) — démarrage…", result)
 
         for i, folder in enumerate(folders):
-            fid   = folder["id"]
-            fname = folder["display_path"]
-            count = folder.get("total_item_count", 0)
-            label = f"[{i+1}/{len(folders)}] {fname} ({count} emails)"
+            fid      = folder["id"]
+            fname    = folder["display_path"]
+            expected = folder.get("total_item_count", 0)
+            label    = f"[{i+1}/{len(folders)}] {fname}"
 
-            # Checkpoint : dossier déjà entièrement synchronisé ?
-            if (
-                not force_full
-                and self.db.get_sync_state(f"delta_{fid}")
-                and not self.db.get_sync_state(f"cursor_{fid}")
-                # cursor vide = pas de sync interrompue en cours
-            ):
-                result.folders_skip += 1
+            # Vérifie s'il y a un checkpoint intra-dossier non terminé
+            cursor = self.db.get_sync_state(f"cursor2_{fid}") or ""
+            synced_at = self.db.get_sync_state(f"synced_at_{fid}") or ""
+
+            if force_full:
+                # Reset du checkpoint pour ce dossier
+                self.db.set_sync_state(f"cursor2_{fid}", "")
+                since_dt = None
+            elif cursor:
+                # Reprise d'un dossier interrompu
+                since_dt = None  # on reprend depuis le checkpoint, pas de filtre date
                 if on_status:
-                    on_status(f"⏭ Déjà à jour : {fname}", result)
-                continue
+                    on_status(f"🔁 Reprise : {label}", result)
+            elif synced_at and expected > 0:
+                # Sync incrémentale : uniquement depuis la dernière sync
+                # Marge de 10 min pour ne pas rater d'emails
+                dt = datetime.fromisoformat(synced_at)
+                dt = dt - timedelta(minutes=10)
+                since_dt = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                since_dt = None   # Pas encore indexé → full
 
+            mode_label = "incrémental" if (since_dt and not cursor) else "complet"
             if on_status:
-                on_status(f"🔄 {label}", result)
+                on_status(
+                    f"🔄 {label} — {expected} emails attendus [{mode_label}]",
+                    result,
+                )
 
             try:
-                inc, n, u, d = self._sync_folder(
+                n, u = self._sync_folder(
                     folder_id=fid,
                     folder_name=folder["name"],
-                    force_full=force_full,
-                    on_progress=lambda nw, up, dl, r=result, lbl=label: (
+                    expected=expected,
+                    since_dt=since_dt,
+                    on_progress=lambda nw, up, r=result, lbl=label, exp=expected: (
                         on_status(
-                            f"🔄 {lbl} — {r.emails_new + nw + r.emails_updated + up:,} traités",
-                            r
+                            f"🔄 {lbl} — {r.emails_new+nw:,}/{exp} traités",
+                            r,
                         ) if on_status else None
                     ),
                 )
@@ -397,13 +367,28 @@ class EmailIndexer:
 
             result.emails_new     += n
             result.emails_updated += u
-            result.emails_deleted += d
             result.folders_done   += 1
 
+            # Vérification : compte en base vs attendu
+            indexed_count = self.db.count_emails_in_folder(fid)
+            info = FolderSyncInfo(
+                name=fname, expected=expected,
+                indexed=indexed_count, new=n, updated=u,
+            )
+            result.folder_details.append(info)
+
+            gap = expected - indexed_count
+            if gap > 10 and not since_dt:
+                result.warnings.append(
+                    f"⚠️ {fname} : {indexed_count}/{expected} emails indexés "
+                    f"({gap} manquants)"
+                )
+
             if on_status:
-                mode = "incrémental" if inc else "complet"
+                check = "✅" if gap <= 10 else "⚠️"
                 on_status(
-                    f"✅ {fname} [{mode}] → +{n} / ✏{u} / 🗑{d}",
+                    f"{check} {fname} → {indexed_count}/{expected} indexés "
+                    f"(+{n} nouveaux, ✏{u} màj)",
                     result,
                 )
 

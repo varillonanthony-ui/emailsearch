@@ -180,6 +180,28 @@ class Database:
         cur.execute("SELECT id FROM emails WHERE folder_id = ?", (folder_id,))
         return {row["id"] for row in cur.fetchall()}
 
+    def count_emails_in_folder(self, folder_id: str) -> int:
+        """Compte les emails indexés pour un dossier (pour vérification post-sync)."""
+        cur = self._conn_get().cursor()
+        cur.execute("SELECT COUNT(*) AS n FROM emails WHERE folder_id = ?", (folder_id,))
+        return cur.fetchone()["n"]
+
+    def upsert_email(self, d: dict):
+        """Alias pour mise à jour d'un email unique (ex: mise en cache du corps)."""
+        self.upsert_emails_batch([d])
+
+    def reset_all(self):
+        """
+        Supprime toutes les données (emails, FTS, dossiers, états de sync).
+        Utilisé pour repartir d'une base propre.
+        """
+        conn = self._conn_get()
+        conn.execute("DELETE FROM emails")
+        conn.execute("DELETE FROM emails_fts")
+        conn.execute("DELETE FROM folders")
+        conn.execute("DELETE FROM sync_state")
+        conn.commit()
+
     def get_email_detail(self, email_id: str) -> dict | None:
         """Retourne tous les champs d'un email (dont le corps complet)."""
         cur = self._conn_get().cursor()
