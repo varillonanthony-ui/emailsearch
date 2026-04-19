@@ -311,9 +311,10 @@ def _fmt_size(n: int) -> str:
 
 def show_attachment_preview(email_id: str, att: dict, token: str, uid: str):
     """
-    Affiche un aperçu d'une pièce jointe sans téléchargement côté utilisateur.
-    Les octets transitent Graph API → base64 → iframe/img dans le navigateur.
+    Aperçu d'une PJ sans téléchargement utilisateur et sans st.rerun().
+    Les octets transitent : Graph API → base64 → data-URI → navigateur.
     """
+    import base64 as _b64
     import streamlit.components.v1 as _c
     from email_indexer import EmailIndexer as _EI
 
@@ -321,102 +322,79 @@ def show_attachment_preview(email_id: str, att: dict, token: str, uid: str):
     ct   = att["contentType"].lower()
     size = att["size"]
     ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-
-    # Pas d'aperçu auto au-delà de 8 Mo (trop lent)
-    MAX_PREVIEW = 8 * 1024 * 1024
-
     icon = _attachment_icon(name, ct)
-    st.markdown(f"**{icon} {name}** — {_fmt_size(size)}")
 
-    key_btn = f"pj_load_{email_id}_{att['id']}"
-    key_dat = f"pj_data_{email_id}_{att['id']}"
+    MAX_PREVIEW = 8 * 1024 * 1024   # 8 Mo
 
-    # ── Bouton de chargement (évite de recharger à chaque rerender) ───────────
-    if key_dat not in st.session_state:
+    with st.expander(f"{icon} **{name}** — {_fmt_size(size)}", expanded=False):
         if size > MAX_PREVIEW:
             st.caption(f"⚠️ Fichier trop volumineux pour l'aperçu ({_fmt_size(size)})")
             return
-        if st.button(f"👁 Aperçu", key=key_btn):
-            with st.spinner("Chargement…"):
-                b64, content_type = _EI(token, uid).get_attachment_content(
-                    email_id, att["id"]
-                )
-            if b64:
-                st.session_state[key_dat] = (b64, content_type or ct)
-                st.rerun()
-            else:
-                st.warning("Impossible de charger cette pièce jointe.")
+
+        # Chargement direct au clic sur l'expander — pas de bouton intermédiaire,
+        # pas de st.rerun() → stable même sur Streamlit Cloud
+        with st.spinner("Chargement de la pièce jointe…"):
+            b64, content_type = _EI(token, uid).get_attachment_content(email_id, att["id"])
+            if not content_type:
+                content_type = ct
+
+        if not b64:
+            st.warning("Impossible de charger cette pièce jointe.")
             return
 
-    if key_dat not in st.session_state:
-        return
+        # ── Image ─────────────────────────────────────────────────────────────
+        if content_type.startswith("image/"):
+            img_html = (
+                '<div style="max-width:100%;overflow:auto;background:#f8f8f8;' +
+                'border:1px solid #ddd;border-radius:6px;padding:8px">' +
+                '<img src="data:' + content_type + ';base64,' + b64 +
+                '" style="max-width:100%;height:auto;display:block;margin:auto"/></div>'
+            )
+            _c.html(img_html, height=450, scrolling=True)
 
-    b64, content_type = st.session_state[key_dat]
+        # ── PDF ───────────────────────────────────────────────────────────────
+        elif content_type == "application/pdf" or ext == "pdf":
+            pdf_src  = "data:application/pdf;base64," + b64
+            pdf_html = ('<iframe src="' + pdf_src +
+                        '" width="100%" height="650px" ' +
+                        'style="border:1px solid #ddd;border-radius:6px"></iframe>')
+            _c.html(pdf_html, height=670, scrolling=False)
 
-    # ── Image ─────────────────────────────────────────────────────────────────
-    if content_type.startswith("image/"):
-        _c.html(
-            f'''<div style="max-width:100%;overflow:auto;background:#f8f8f8;
-                          border:1px solid #ddd;border-radius:6px;padding:8px">
-              <img src="data:{content_type};base64,{b64}"
-                   style="max-width:100%;height:auto;display:block;margin:auto"/>
-            </div>''',
-            height=420, scrolling=True,
-        )
+        # ── Texte / CSV / JSON ────────────────────────────────────────────────
+        elif content_type.startswith("text/") or ext in ("txt","csv","log","json","xml","md"):
+            try:
+                text = _b64.b64decode(b64).decode("utf-8", errors="replace")
+                st.code(text[:5000] + ("…" if len(text) > 5000 else ""),
+                        language="csv" if ext == "csv" else
+                                 "json" if ext == "json" else None)
+            except Exception:
+                st.warning("Impossible de décoder ce fichier texte.")
 
-    # ── PDF ───────────────────────────────────────────────────────────────────
-    elif content_type == "application/pdf" or ext == "pdf":
-        pdf_src = "data:application/pdf;base64," + b64
-        pdf_html = f'<iframe src="{pdf_src}" width="100%" height="600px" style="border:1px solid #ddd;border-radius:6px"></iframe>'
-        _c.html(pdf_html, height=620, scrolling=False)
-
-
-
-    # ── Texte / CSV ───────────────────────────────────────────────────────────
-    elif content_type.startswith("text/") or ext in ("txt", "csv", "log", "json", "xml"):
-        import base64 as _b64
-        try:
-            text = _b64.b64decode(b64).decode("utf-8", errors="replace")
-            st.code(text[:5000] + ("…" if len(text) > 5000 else ""),
-                    language="csv" if ext == "csv" else None)
-        except Exception:
-            st.warning("Impossible de décoder le fichier texte.")
-
-    # ── Office (Word / Excel / PowerPoint) ────────────────────────────────────
-    elif ext in ("docx", "doc", "xlsx", "xls", "pptx", "ppt"):
-        import base64 as _b64
-        # Reconstruit les bytes → URL data pour le viewer Microsoft Online
-        # Le viewer Office Online accepte une URL source publique
-        # Pour les PJ email (non publiques) on propose un rendu via HTML embed
-        raw = _b64.b64decode(b64)
-        # Fallback : affiche les premières lignes de texte extractible
-        try:
+        # ── Word / Excel / PowerPoint (extraction texte via ZIP) ──────────────
+        elif ext in ("docx","doc","xlsx","xls","pptx","ppt"):
             import zipfile, io, re as _re
-            z = zipfile.ZipFile(io.BytesIO(raw))
-            xml_files = [n for n in z.namelist()
-                        if n.endswith(".xml") and ("word/document" in n
-                        or "xl/sharedStrings" in n or "ppt/slides/slide1" in n)]
-            texts = []
-            for xf in xml_files[:3]:
-                xml = z.read(xf).decode("utf-8", errors="ignore")
-                texts.append(_re.sub(r"<[^>]+>", " ", xml))
-            preview_text = " ".join(texts)
-            preview_text = _re.sub(r"\s+", " ", preview_text).strip()[:2000]
-            if preview_text:
-                st.markdown("**Aperçu du contenu textuel :**")
-                st.text(preview_text)
-            else:
+            try:
+                raw = _b64.b64decode(b64)
+                z   = zipfile.ZipFile(io.BytesIO(raw))
+                xml_targets = [n for n in z.namelist() if n.endswith(".xml") and (
+                    "word/document" in n or "xl/sharedStrings" in n
+                    or "ppt/slides/slide" in n)]
+                texts = []
+                for xf in xml_targets[:5]:
+                    xml = z.read(xf).decode("utf-8", errors="ignore")
+                    texts.append(_re.sub(r"<[^>]+>", " ", xml))
+                preview = _re.sub(r"\s+", " ", " ".join(texts)).strip()[:3000]
+                if preview:
+                    st.markdown("**Aperçu du contenu textuel :**")
+                    st.text(preview)
+                else:
+                    st.info("Aperçu texte non disponible. Ouvrez dans Outlook.")
+            except Exception:
                 st.info("Aperçu non disponible pour ce format. Ouvrez dans Outlook.")
-        except Exception:
-            st.info("Aperçu non disponible pour ce format. Ouvrez dans Outlook.")
 
-    # ── Autres formats ────────────────────────────────────────────────────────
-    else:
-        st.info(f"Aperçu non disponible pour les fichiers {ext.upper() or content_type}.")
-
-    if st.button("✖ Fermer l'aperçu", key=f"pj_close_{email_id}_{att['id']}"):
-        st.session_state.pop(key_dat, None)
-        st.rerun()
+        # ── Autres ────────────────────────────────────────────────────────────
+        else:
+            st.info(f"Aperçu non disponible pour les fichiers .{ext or content_type}.")
 
 
 
@@ -467,6 +445,7 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=Non
 
         with st.expander(
             f"{'🔵 ' if not email['is_read'] else '⚪ '}"
+            f"{'📎 ' if email['has_attachments'] else ''}"
             f"{email['subject'] or '(Sans objet)'} "
             f"— {email['sender_name'] or email['sender_email']} "
             f"— {fmt_date(email['received_datetime'])}"):
@@ -516,16 +495,11 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=Non
                     uid = user_id or st.session_state.get("user_info", {}).get("id", "x")
                     if tok:
                         from email_indexer import EmailIndexer as _EI2
-                        att_key = f"atts_{email['id']}"
-                        if att_key not in st.session_state:
-                            with st.spinner("Récupération des pièces jointes…"):
-                                st.session_state[att_key] = _EI2(tok, uid).list_attachments(email["id"])
-                        atts = st.session_state.get(att_key, [])
+                        with st.spinner("Récupération de la liste des pièces jointes…"):
+                            atts = _EI2(tok, uid).list_attachments(email["id"])
                         if atts:
                             for att in atts:
-                                with st.container():
-                                    show_attachment_preview(email["id"], att, tok, uid)
-                                    st.markdown("---")
+                                show_attachment_preview(email["id"], att, tok, uid)
                         else:
                             st.caption("Aucune pièce jointe accessible.")
 
