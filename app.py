@@ -284,7 +284,7 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
         st.session_state.pop("sync_force_full", None)
 
 
-def show_results(db, keywords, folder_filter, folder_ids, tab_key):
+def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=None, date_to=None):
     page_key = f"page_{tab_key}"
     if page_key not in st.session_state:
         st.session_state[page_key] = 0
@@ -295,9 +295,15 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key):
         return
 
     with st.spinner("Recherche…"):
-        results, total = db.search_emails(keywords=keywords, folder_filter=folder_filter,
-                                          folder_ids=folder_ids, limit=PAGE_SIZE,
-                                          offset=page * PAGE_SIZE)
+        results, total = db.search_emails(
+            keywords=keywords,
+            folder_filter=folder_filter,
+            folder_ids=folder_ids,
+            date_from=date_from,
+            date_to=date_to,
+            limit=PAGE_SIZE,
+            offset=page * PAGE_SIZE,
+        )
     if total == 0:
         st.warning(f"Aucun résultat pour : **{' + '.join(keywords)}**  "
                    "(tous les mots-clés doivent être présents)")
@@ -461,14 +467,29 @@ def page_main():
 
     st.markdown("# 📧 Recherche d'emails")
     with st.form("search_form"):
-        kw_input  = st.text_input(
+        kw_input = st.text_input(
             "🔍 Mots-clés",
             placeholder="Ex: réunion budget   ou   réunion, budget   ou   réunion; budget",
             help=(
-                "Séparez les mots-clés par une virgule, un point-virgule ou un espace. "
-                "Logique ET : TOUS les mots-clés doivent être présents dans l'email."
+                "Séparez par virgule, point-virgule ou double-espace. "
+                "Logique ET : TOUS les mots-clés doivent être présents."
             ),
         )
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            date_from = st.date_input(
+                "📅 Date de début",
+                value=None,
+                format="DD/MM/YYYY",       # format français
+                help="Laisser vide pour ne pas filtrer (JJ/MM/AAAA)",
+            )
+        with col_d2:
+            date_to = st.date_input(
+                "📅 Date de fin",
+                value=None,
+                format="DD/MM/YYYY",       # format français
+                help="Laisser vide pour ne pas filtrer (JJ/MM/AAAA)",
+            )
         submitted = st.form_submit_button("Rechercher", type="primary", use_container_width=True)
 
     # Découpe sur virgule, point-virgule OU espaces multiples
@@ -477,8 +498,12 @@ def page_main():
         [k for k in _re.split(r"[,;]+|\s{2,}", kw_input.strip()) if k.strip()]
         if kw_input else []
     )
-    # Nettoyage final de chaque mot-clé
     keywords = [k.strip() for k in keywords if k.strip()]
+
+    # Convertit les dates en ISO string (None si non renseigné)
+    # date_input renvoie un objet date Python → isoformat() donne "YYYY-MM-DD" pour la DB
+    df_iso = date_from.isoformat() if date_from else None
+    dt_iso = date_to.isoformat()   if date_to   else None
 
     if submitted and not keywords:
         st.warning("Veuillez entrer au moins un mot-clé.")
@@ -489,23 +514,45 @@ def page_main():
         "📁 Dossier spécifique",
     ])
 
-    kw_active = keywords if submitted else st.session_state.get("search_kw", [])
+    if submitted:
+        st.session_state["search_date_from"] = df_iso
+        st.session_state["search_date_to"]   = dt_iso
 
-    # Affiche les mots-clés actifs pour confirmation visuelle
+    kw_active  = keywords if submitted else st.session_state.get("search_kw", [])
+    df_active  = df_iso   if submitted else st.session_state.get("search_date_from")
+    dt_active  = dt_iso   if submitted else st.session_state.get("search_date_to")
+
+    # Confirmation visuelle des filtres actifs
     if kw_active:
-        tags = "  ".join(f"`{k}`" for k in kw_active)
+        tags     = "  ".join(f"`{k}`" for k in kw_active)
+        date_str = ""
+        def _fr(iso: str) -> str:
+            """Convertit YYYY-MM-DD en JJ/MM/AAAA pour l'affichage."""
+            try:
+                y, m, d = iso[:10].split("-")
+                return f"{d}/{m}/{y}"
+            except Exception:
+                return iso
+
+        if df_active and dt_active:
+            date_str = f" &nbsp;|&nbsp; 📅 du **{_fr(df_active)}** au **{_fr(dt_active)}**"
+        elif df_active:
+            date_str = f" &nbsp;|&nbsp; 📅 depuis le **{_fr(df_active)}**"
+        elif dt_active:
+            date_str = f" &nbsp;|&nbsp; 📅 jusqu'au **{_fr(dt_active)}**"
         st.markdown(
-            f"🔍 Recherche active : {tags} &nbsp;—&nbsp; "
-            f"logique **ET** (tous les mots-clés doivent être présents)",
+            f"🔍 {tags}{date_str} &nbsp;—&nbsp; logique **ET**",
             unsafe_allow_html=True,
         )
 
     with tab_all:
-        if kw_active: show_results(db, kw_active, "all", None, "all")
+        if kw_active:
+            show_results(db, kw_active, "all", None, "all", df_active, dt_active)
         else: st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
     with tab_no_sent:
-        if kw_active: show_results(db, kw_active, "no_sent_deleted", None, "no_sent")
+        if kw_active:
+            show_results(db, kw_active, "no_sent_deleted", None, "no_sent", df_active, dt_active)
         else: st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
     with tab_specific:
@@ -517,12 +564,13 @@ def page_main():
             selected  = st.selectbox("Choisir un dossier", options=list(folder_map.keys()))
             folder_id = folder_map.get(selected)
             if kw_active and folder_id:
-                show_results(db, kw_active, "specific", [folder_id], "specific")
+                show_results(db, kw_active, "specific", [folder_id], "specific", df_active, dt_active)
             elif not kw_active:
                 st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
     if submitted and keywords:
         st.session_state["search_kw"] = keywords
+        # dates already saved above
 
 
 # ── Point d'entrée ───────────────────────────────────────────────────────────

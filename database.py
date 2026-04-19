@@ -276,18 +276,20 @@ class Database:
         keywords: list[str],
         folder_filter: str = "all",
         folder_ids: list[str] | None = None,
+        date_from: str | None = None,   # "YYYY-MM-DD" ou None
+        date_to:   str | None = None,   # "YYYY-MM-DD" ou None
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[dict], int]:
         """
-        Recherche multi-mots-clés avec logique ET stricte et normalisation Unicode.
+        Recherche multi-mots-clés avec logique ET, filtre date et normalisation Unicode.
 
-        Stratégie en 2 temps :
-        1. SQL : filtre rapide sur le 1er mot-clé via LIKE (réduit le dataset)
-        2. Python : filtre ET strict sur TOUS les mots-clés avec normalisation
-           Unicode complète (accents, casse) — 100% fiable.
+        Stratégie :
+        1. SQL : filtre dossier + date (réduit le dataset côté base)
+        2. Python : filtre ET strict sur les mots-clés avec normalisation Unicode
+           (accents, casse) — 100% fiable.
 
-        Si UN SEUL mot-clé est absent de toutes les colonnes → email exclu.
+        Paramètres date : "YYYY-MM-DD" ou None (= pas de filtre).
         """
         conn = self._conn_get()
         cur  = conn.cursor()
@@ -297,25 +299,32 @@ class Database:
         if not clean_kws:
             return [], 0
 
-        # ── Filtre dossiers ─────────────────────────────────────────────────
-        folder_conditions: list[str] = []
-        folder_params:     list      = []
+        # ── Filtres SQL (dossier + date) ─────────────────────────────────────
+        sql_conditions: list[str] = []
+        sql_params:     list      = []
 
         if folder_filter == "no_sent_deleted":
             ph = ",".join("?" * len(self.EXCLUDED_FOLDER_NAMES))
-            folder_conditions.append(f"e.folder_name NOT IN ({ph})")
-            folder_params.extend(self.EXCLUDED_FOLDER_NAMES)
+            sql_conditions.append(f"e.folder_name NOT IN ({ph})")
+            sql_params.extend(self.EXCLUDED_FOLDER_NAMES)
         elif folder_filter == "specific" and folder_ids:
             ph = ",".join("?" * len(folder_ids))
-            folder_conditions.append(f"e.folder_id IN ({ph})")
-            folder_params.extend(folder_ids)
+            sql_conditions.append(f"e.folder_id IN ({ph})")
+            sql_params.extend(folder_ids)
 
-        folder_where = ("WHERE " + " AND ".join(folder_conditions)
-                        if folder_conditions else "")
+        if date_from:
+            sql_conditions.append("e.received_datetime >= ?")
+            sql_params.append(date_from)          # ISO compare works lexicographically
 
-        # ── Récupération de TOUS les emails du périmètre (sans filtre mot-clé SQL) ──
-        # On laisse Python faire le filtrage multi-mots-clés pour être 100% fiable.
-        # Pour les très grosses boîtes, on charge uniquement les colonnes utiles.
+        if date_to:
+            # Inclut toute la journée de date_to
+            sql_conditions.append("e.received_datetime < ?")
+            dt_end = date_to + "T23:59:59"
+            sql_params.append(dt_end)
+
+        where = ("WHERE " + " AND ".join(sql_conditions)) if sql_conditions else ""
+
+        # ── Récupération des emails du périmètre ─────────────────────────────
         cur.execute(f"""
             SELECT e.id, e.folder_id, e.folder_name, e.subject,
                    e.sender_name, e.sender_email, e.recipients,
@@ -324,26 +333,23 @@ class Database:
                    e.has_attachments, e.is_read, e.importance,
                    e.web_link, e.conversation_id
             FROM emails e
-            {folder_where}
+            {where}
             ORDER BY e.received_datetime DESC
-        """, folder_params)
+        """, sql_params)
 
         rows = cur.fetchall()
 
-        # ── Filtrage Python avec normalisation Unicode ───────────────────────
+        # ── Filtrage Python multi-mots-clés (normalisation Unicode) ──────────
         matched: list[dict] = []
         for row in rows:
-            # Concatène tous les champs cherchables en une seule chaîne normalisée
             haystack = self._normalize(" ".join([
-                row["subject"]       or "",
-                row["sender_name"]   or "",
-                row["sender_email"]  or "",
-                row["recipients"]    or "",
-                row["body_preview"]  or "",
-                row["body"]          or "",
+                row["subject"]      or "",
+                row["sender_name"]  or "",
+                row["sender_email"] or "",
+                row["recipients"]   or "",
+                row["body_preview"] or "",
+                row["body"]         or "",
             ]))
-
-            # Logique ET : TOUS les mots-clés doivent être présents
             if all(kw in haystack for kw in clean_kws):
                 matched.append(dict(row))
 
