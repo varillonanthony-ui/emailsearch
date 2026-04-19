@@ -284,7 +284,7 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
         st.session_state.pop("sync_force_full", None)
 
 
-def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=None, date_to=None):
+def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=None, date_to=None, user_id=None):
     page_key = f"page_{tab_key}"
     if page_key not in st.session_state:
         st.session_state[page_key] = 0
@@ -367,7 +367,7 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key, date_from=Non
                     if token:
                         with st.spinner("Chargement du corps…"):
                             from email_indexer import EmailIndexer as _EI
-                            body = _EI(token, user_id).get_email_body(email["id"])
+                            body = _EI(token, user_id or st.session_state.get('user_info',{}).get('id','x')).get_email_body(email["id"])
                             if body and full:
                                 # Mise en cache en base pour les prochaines fois
                                 full["body"] = body
@@ -547,12 +547,12 @@ def page_main():
 
     with tab_all:
         if kw_active:
-            show_results(db, kw_active, "all", None, "all", df_active, dt_active)
+            show_results(db, kw_active, "all", None, "all", df_active, dt_active, user_id)
         else: st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
     with tab_no_sent:
         if kw_active:
-            show_results(db, kw_active, "no_sent_deleted", None, "no_sent", df_active, dt_active)
+            show_results(db, kw_active, "no_sent_deleted", None, "no_sent", df_active, dt_active, user_id)
         else: st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
     with tab_specific:
@@ -564,7 +564,7 @@ def page_main():
             selected  = st.selectbox("Choisir un dossier", options=list(folder_map.keys()))
             folder_id = folder_map.get(selected)
             if kw_active and folder_id:
-                show_results(db, kw_active, "specific", [folder_id], "specific", df_active, dt_active)
+                show_results(db, kw_active, "specific", [folder_id], "specific", df_active, dt_active, user_id)
             elif not kw_active:
                 st.info("ℹ️ Entrez des mots-clés ci-dessus pour rechercher.")
 
