@@ -183,30 +183,95 @@ def highlight_keywords(text, keywords):
 
 # ── Synchronisation ───────────────────────────────────────────────────────────
 
-def run_sync(access_token, user_id):
-    st.markdown("### 🔄 Synchronisation en cours…")
-    status_ph  = st.empty()
-    counter_ph = st.empty()
-    progress   = st.progress(0.0)
-    indexer = EmailIndexer(access_token, user_id)
+def run_sync(access_token: str, user_id: str, force_full: bool = False):
+    """
+    Lance la synchronisation.
+    force_full=False → incrémentale (delta tokens, seuls les changements)
+    force_full=True  → complète (réinitialise les delta tokens, tout re-télécharge)
+    """
+    from email_indexer import SyncResult
 
-    def on_status(msg, count):
+    mode_label = "Synchronisation complète" if force_full else "Synchronisation incrémentale"
+    st.markdown(f"### 🔄 {mode_label} en cours…")
+
+    if not force_full:
+        st.info(
+            "⚡ **Mode incrémental** : seuls les emails nouveaux, modifiés ou supprimés "
+            "depuis la dernière synchronisation sont traités. Les emails déjà indexés "
+            "sont conservés tels quels."
+        )
+    else:
+        st.warning(
+            "🔁 **Mode complet** : tous les delta tokens sont réinitialisés. "
+            "L'intégralité de la boîte mail va être re-téléchargée et réindexée."
+        )
+
+    status_ph = st.empty()
+    cols      = st.columns(4)
+    new_ph    = cols[0].empty()
+    upd_ph    = cols[1].empty()
+    del_ph    = cols[2].empty()
+    fold_ph   = cols[3].empty()
+    progress  = st.progress(0.0)
+
+    indexer = EmailIndexer(access_token, user_id)
+    result  = SyncResult()
+
+    def on_status(msg: str, r: SyncResult):
+        nonlocal result
+        result = r
         status_ph.info(f"📬 {msg}")
-        counter_ph.metric("Emails indexés", f"{count:,}")
+        new_ph.metric("🆕 Nouveaux",   f"{r.emails_new:,}")
+        upd_ph.metric("✏️ Modifiés",   f"{r.emails_updated:,}")
+        del_ph.metric("🗑️ Supprimés",  f"{r.emails_deleted:,}")
+        fold_ph.metric("📁 Dossiers",
+                       f"{r.folders_delta + r.folders_full}/{r.total_folders}")
+        if r.total_folders:
+            progress.progress(
+                min((r.folders_delta + r.folders_full) / r.total_folders, 1.0)
+            )
 
     try:
-        total = indexer.full_sync(on_status=on_status)
+        result = indexer.sync(force_full=force_full, on_status=on_status)
         progress.progress(1.0)
-        st.success(f"✅ Synchronisation terminée — **{total:,}** emails indexés / mis à jour.")
+
+        # Résumé final
+        parts = []
+        if result.emails_new:
+            parts.append(f"**{result.emails_new:,}** nouveaux emails")
+        if result.emails_updated:
+            parts.append(f"**{result.emails_updated:,}** mis à jour")
+        if result.emails_deleted:
+            parts.append(f"**{result.emails_deleted:,}** supprimés")
+        if not parts:
+            parts = ["aucun changement détecté"]
+
+        inc_info = (
+            f"{result.folders_delta} dossier(s) en mode incrémental, "
+            f"{result.folders_full} en mode complet"
+        )
+        st.success(
+            f"✅ **{mode_label} terminée** — {', '.join(parts)}. "
+            f"({inc_info})"
+        )
+
+        if result.errors:
+            with st.expander(f"⚠️ {len(result.errors)} erreur(s) non bloquante(s)"):
+                for err in result.errors:
+                    st.caption(err)
+
         st.session_state.pop("show_sync", None)
+        st.session_state.pop("sync_force_full", None)
         st.rerun()
+
     except PermissionError as e:
         st.error(str(e))
         for k in ["user_info", "access_token", "refresh_token"]:
             st.session_state.pop(k, None)
     except Exception as e:
-        st.error(f"Erreur : {e}")
+        st.error(f"Erreur de synchronisation : {e}")
         st.session_state.pop("show_sync", None)
+        st.session_state.pop("sync_force_full", None)
 
 
 # ── Résultats de recherche ────────────────────────────────────────────────────
@@ -326,8 +391,18 @@ def page_main():
             except Exception:
                 pass
         st.markdown("---")
-        if st.button("🔄 Synchroniser les emails", use_container_width=True, type="primary"):
-            st.session_state["show_sync"] = True
+        if st.button("⚡ Sync incrémentale", use_container_width=True, type="primary",
+                     help="Traite uniquement les emails nouveaux, modifiés ou supprimés "
+                          "depuis la dernière synchronisation."):
+            st.session_state["show_sync"]       = True
+            st.session_state["sync_force_full"] = False
+            st.rerun()
+        if st.button("🔁 Sync complète (reset)", use_container_width=True,
+                     help="Réinitialise tous les delta tokens et re-télécharge "
+                          "l'intégralité de la boîte mail. À utiliser si vous soupçonnez "
+                          "un désynchronisation ou après une longue absence."):
+            st.session_state["show_sync"]       = True
+            st.session_state["sync_force_full"] = True
             st.rerun()
         with st.expander("📊 Emails par dossier"):
             for row in stats["by_folder"][:15]:
@@ -342,10 +417,12 @@ def page_main():
     if st.session_state.get("show_sync"):
         token = get_access_token()
         if token:
-            run_sync(token, user_id)
+            force_full = st.session_state.get("sync_force_full", False)
+            run_sync(token, user_id, force_full=force_full)
         else:
             st.error("Session expirée, reconnectez-vous.")
             st.session_state.pop("show_sync", None)
+            st.session_state.pop("sync_force_full", None)
         return
 
     st.markdown("# 📧 Recherche d'emails")
