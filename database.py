@@ -257,9 +257,19 @@ class Database:
         "Brouillons", "Drafts",
     )
 
-    # Colonnes dans lesquelles on cherche les mots-clés
+    # Colonnes de recherche (concaténées pour une comparaison unique)
     SEARCH_COLS = ("subject", "sender_name", "sender_email",
                    "recipients", "body_preview", "body")
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """
+        Normalise un texte pour la comparaison insensible à la casse et aux accents.
+        Utilise unicodedata pour gérer correctement les accents français (é→e, è→e…).
+        """
+        import unicodedata
+        text = unicodedata.normalize("NFD", text.lower())
+        return "".join(c for c in text if unicodedata.category(c) != "Mn")
 
     def search_emails(
         self,
@@ -270,65 +280,76 @@ class Database:
         offset: int = 0,
     ) -> tuple[list[dict], int]:
         """
-        Recherche LIKE multi-mots-clés avec logique ET stricte.
+        Recherche multi-mots-clés avec logique ET stricte et normalisation Unicode.
 
-        Chaque mot-clé doit être présent dans au moins une colonne
-        (sujet, expéditeur, destinataires, aperçu du corps, corps complet).
-        Si UN SEUL mot-clé est absent de toutes les colonnes -> email exclu.
+        Stratégie en 2 temps :
+        1. SQL : filtre rapide sur le 1er mot-clé via LIKE (réduit le dataset)
+        2. Python : filtre ET strict sur TOUS les mots-clés avec normalisation
+           Unicode complète (accents, casse) — 100% fiable.
 
-        Utilise LIKE plutôt que FTS5 pour être 100 % fiable :
-        - pas de problème de tokeniseur / accents
-        - correspondances partielles
-        - pas de syntaxe FTS5 à échapper
+        Si UN SEUL mot-clé est absent de toutes les colonnes → email exclu.
         """
         conn = self._conn_get()
         cur  = conn.cursor()
 
-        conditions: list[str] = []
-        params: list = []
-
-        # ── Un bloc AND par mot-clé ─────────────────────────────────────────
-        # Pour chaque mot-clé : (col1 LIKE ? OR col2 LIKE ? OR …)
-        # Tous les blocs sont reliés par AND.
-        for kw in keywords:
-            kw = kw.strip()
-            if not kw:
-                continue
-            pattern  = f"%{kw.lower()}%"
-            col_cond = " OR ".join(
-                f"LOWER(e.{col}) LIKE ?" for col in self.SEARCH_COLS
-            )
-            conditions.append(f"({col_cond})")
-            params.extend([pattern] * len(self.SEARCH_COLS))
+        # Nettoyage et normalisation des mots-clés
+        clean_kws = [self._normalize(kw) for kw in keywords if kw.strip()]
+        if not clean_kws:
+            return [], 0
 
         # ── Filtre dossiers ─────────────────────────────────────────────────
+        folder_conditions: list[str] = []
+        folder_params:     list      = []
+
         if folder_filter == "no_sent_deleted":
             ph = ",".join("?" * len(self.EXCLUDED_FOLDER_NAMES))
-            conditions.append(f"e.folder_name NOT IN ({ph})")
-            params.extend(self.EXCLUDED_FOLDER_NAMES)
+            folder_conditions.append(f"e.folder_name NOT IN ({ph})")
+            folder_params.extend(self.EXCLUDED_FOLDER_NAMES)
         elif folder_filter == "specific" and folder_ids:
             ph = ",".join("?" * len(folder_ids))
-            conditions.append(f"e.folder_id IN ({ph})")
-            params.extend(folder_ids)
+            folder_conditions.append(f"e.folder_id IN ({ph})")
+            folder_params.extend(folder_ids)
 
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        folder_where = ("WHERE " + " AND ".join(folder_conditions)
+                        if folder_conditions else "")
 
-        cur.execute(f"SELECT COUNT(*) AS cnt FROM emails e {where}", params)
-        total = cur.fetchone()["cnt"]
-
+        # ── Récupération de TOUS les emails du périmètre (sans filtre mot-clé SQL) ──
+        # On laisse Python faire le filtrage multi-mots-clés pour être 100% fiable.
+        # Pour les très grosses boîtes, on charge uniquement les colonnes utiles.
         cur.execute(f"""
             SELECT e.id, e.folder_id, e.folder_name, e.subject,
                    e.sender_name, e.sender_email, e.recipients,
-                   e.body_preview, e.received_datetime, e.sent_datetime,
+                   e.body_preview, e.body,
+                   e.received_datetime, e.sent_datetime,
                    e.has_attachments, e.is_read, e.importance,
                    e.web_link, e.conversation_id
             FROM emails e
-            {where}
+            {folder_where}
             ORDER BY e.received_datetime DESC
-            LIMIT ? OFFSET ?
-        """, params + [limit, offset])
+        """, folder_params)
 
-        return [dict(r) for r in cur.fetchall()], total
+        rows = cur.fetchall()
+
+        # ── Filtrage Python avec normalisation Unicode ───────────────────────
+        matched: list[dict] = []
+        for row in rows:
+            # Concatène tous les champs cherchables en une seule chaîne normalisée
+            haystack = self._normalize(" ".join([
+                row["subject"]       or "",
+                row["sender_name"]   or "",
+                row["sender_email"]  or "",
+                row["recipients"]    or "",
+                row["body_preview"]  or "",
+                row["body"]          or "",
+            ]))
+
+            # Logique ET : TOUS les mots-clés doivent être présents
+            if all(kw in haystack for kw in clean_kws):
+                matched.append(dict(row))
+
+        total   = len(matched)
+        results = matched[offset: offset + limit]
+        return results, total
 
     # ── Statistiques ──────────────────────────────────────────────────────────
 

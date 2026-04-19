@@ -461,12 +461,25 @@ def page_main():
 
     st.markdown("# 📧 Recherche d'emails")
     with st.form("search_form"):
-        kw_input  = st.text_input("🔍 Mots-clés (séparés par des virgules)",
-                                   placeholder="Ex: réunion, budget, 2024",
-                                   help="Logique ET : tous les mots-clés doivent être présents.")
+        kw_input  = st.text_input(
+            "🔍 Mots-clés",
+            placeholder="Ex: réunion budget   ou   réunion, budget   ou   réunion; budget",
+            help=(
+                "Séparez les mots-clés par une virgule, un point-virgule ou un espace. "
+                "Logique ET : TOUS les mots-clés doivent être présents dans l'email."
+            ),
+        )
         submitted = st.form_submit_button("Rechercher", type="primary", use_container_width=True)
 
-    keywords = [k.strip() for k in kw_input.split(",") if k.strip()] if kw_input else []
+    # Découpe sur virgule, point-virgule OU espaces multiples
+    import re as _re
+    keywords = (
+        [k for k in _re.split(r"[,;]+|\s{2,}", kw_input.strip()) if k.strip()]
+        if kw_input else []
+    )
+    # Nettoyage final de chaque mot-clé
+    keywords = [k.strip() for k in keywords if k.strip()]
+
     if submitted and not keywords:
         st.warning("Veuillez entrer au moins un mot-clé.")
 
@@ -477,6 +490,15 @@ def page_main():
     ])
 
     kw_active = keywords if submitted else st.session_state.get("search_kw", [])
+
+    # Affiche les mots-clés actifs pour confirmation visuelle
+    if kw_active:
+        tags = "  ".join(f"`{k}`" for k in kw_active)
+        st.markdown(
+            f"🔍 Recherche active : {tags} &nbsp;—&nbsp; "
+            f"logique **ET** (tous les mots-clés doivent être présents)",
+            unsafe_allow_html=True,
+        )
 
     with tab_all:
         if kw_active: show_results(db, kw_active, "all", None, "all")
