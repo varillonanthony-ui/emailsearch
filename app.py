@@ -15,6 +15,8 @@ from auth import start_device_flow, poll_token, refresh_access_token, get_user_i
 from database import Database
 from email_indexer import EmailIndexer
 
+PAGE_SIZE = 25   # emails par page dans les résultats de recherche
+
 st.set_page_config(page_title="📧 Email Search", page_icon="📧",
                    layout="wide", initial_sidebar_state="expanded")
 
