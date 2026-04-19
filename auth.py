@@ -1,102 +1,75 @@
 """
-auth.py – Gestion de l'authentification Microsoft OAuth 2.0 via MSAL.
-Seuls les utilisateurs du tenant configuré peuvent se connecter.
+auth.py – Authentification en deux étapes :
+  1. Mot de passe applicatif (APP_PASSWORD dans les secrets Streamlit)
+  2. Device Code Flow Microsoft — aucun redirect URI requis,
+     fonctionne parfaitement dans les iframes Streamlit Cloud.
 """
 
-import os
-import msal
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+TENANT_ID_KEY  = "AZURE_TENANT_ID"
+CLIENT_ID_KEY  = "AZURE_CLIENT_ID"
+PASSWORD_KEY   = "APP_PASSWORD"
 
-CLIENT_ID     = os.getenv("AZURE_CLIENT_ID")
-CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
-TENANT_ID     = os.getenv("AZURE_TENANT_ID")
-REDIRECT_URI  = os.getenv("REDIRECT_URI", "http://localhost:8501")
+SCOPES = "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access"
 
-# Autorité spécifique au tenant → seuls les comptes du tenant peuvent se connecter
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+# ── Device Code Flow ──────────────────────────────────────────────────────────
 
-SCOPES = [
-    "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/User.Read",
-    # Note : "offline_access", "openid", "profile" sont réservés par MSAL
-    # et ajoutés automatiquement — ne pas les passer explicitement.
-]
-
-
-# ── Helpers MSAL ──────────────────────────────────────────────────────────────
-
-def _build_app(cache: msal.SerializableTokenCache | None = None):
-    """Crée un ConfidentialClientApplication avec cache optionnel."""
-    if cache is None:
-        cache = msal.SerializableTokenCache()
-    app = msal.ConfidentialClientApplication(
-        CLIENT_ID,
-        authority=AUTHORITY,
-        client_credential=CLIENT_SECRET,
-        token_cache=cache,
+def start_device_flow(tenant_id: str, client_id: str) -> dict:
+    """
+    Démarre le device code flow.
+    Retourne le dict contenant 'user_code', 'verification_uri', 'device_code', 'expires_in'.
+    """
+    r = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode",
+        data={"client_id": client_id, "scope": SCOPES},
+        timeout=15,
     )
-    return app, cache
+    r.raise_for_status()
+    return r.json()
 
 
-# ── Auth URL ──────────────────────────────────────────────────────────────────
-
-def get_auth_url() -> str:
-    """Génère l'URL d'autorisation Microsoft pour la page de connexion."""
-    app, _ = _build_app()
-    return app.get_authorization_request_url(
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        prompt="select_account",
+def poll_token(tenant_id: str, client_id: str, device_code: str) -> tuple[str | None, str | None]:
+    """
+    Interroge le endpoint token.
+    Retourne (access_token, refresh_token) ou (None, None) si pas encore validé.
+    """
+    r = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id":   client_id,
+            "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+        },
+        timeout=15,
     )
+    data = r.json()
+    return data.get("access_token"), data.get("refresh_token")
 
 
-# ── Échange code → token ──────────────────────────────────────────────────────
-
-def acquire_token_by_code(code: str) -> tuple[dict, str]:
-    """
-    Échange un code d'autorisation contre un access token.
-    Retourne (result_dict, serialized_cache).
-    """
-    app, cache = _build_app()
-    result = app.acquire_token_by_authorization_code(
-        code,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+def refresh_access_token(tenant_id: str, client_id: str, refresh_token: str) -> str | None:
+    """Rafraîchit silencieusement l'access token avec le refresh token."""
+    r = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id":     client_id,
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh_token,
+            "scope":         SCOPES,
+        },
+        timeout=15,
     )
-    return result, cache.serialize()
-
-
-# ── Refresh silencieux ────────────────────────────────────────────────────────
-
-def acquire_token_silent(cache_state: str) -> tuple[dict | None, str]:
-    """
-    Rafraîchit silencieusement le token depuis le cache.
-    Retourne (result_dict_or_None, new_serialized_cache).
-    """
-    cache = msal.SerializableTokenCache()
-    cache.deserialize(cache_state)
-    app, cache = _build_app(cache)
-
-    accounts = app.get_accounts()
-    if not accounts:
-        return None, cache_state
-
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
-    return result, cache.serialize()
+    data = r.json()
+    return data.get("access_token")
 
 
 # ── Infos utilisateur ─────────────────────────────────────────────────────────
 
 def get_user_info(access_token: str) -> dict | None:
-    """Récupère le profil utilisateur via Microsoft Graph (/me)."""
-    resp = requests.get(
+    """Récupère le profil Microsoft Graph (/me)."""
+    r = requests.get(
         "https://graph.microsoft.com/v1.0/me",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15,
     )
-    if resp.status_code == 200:
-        return resp.json()
-    return None
+    return r.json() if r.status_code == 200 else None
