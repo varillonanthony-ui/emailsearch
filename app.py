@@ -1,701 +1,459 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import sqlite3
-import json
-import requests, re, time, datetime, msal
-import sys, os
-import hashlib
+"""
+app.py – Application Streamlit principale.
+• Authentification Microsoft OAuth 2.0 (même tenant uniquement)
+• Synchronisation complète + incrémentale via Graph API
+• Recherche multi-mots-clés (logique ET) avec filtres par dossier
+• Base de données isolée par utilisateur
+"""
 
-sys.path.append(os.path.dirname(__file__))
-import config
+import streamlit as st
+from datetime import datetime
+
+from auth import get_auth_url, acquire_token_by_code, acquire_token_silent, get_user_info
+from database import Database
+from email_indexer import EmailIndexer
+
+# ── Configuration page ────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="📧 Email Search",
     page_icon="📧",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ── CRÉER LES TABLES SI ELLES N'EXISTENT PAS ──────────────────
-def create_tables(db_path):
-    """Crée la structure de la BD si elle n'existe pas"""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Table principale des emails
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS emails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                email_id TEXT UNIQUE NOT NULL,
-                subject TEXT,
-                sender TEXT,
-                sender_email TEXT,
-                date TEXT,
-                body TEXT,
-                body_preview TEXT,
-                to_recipients TEXT,
-                folder TEXT,
-                is_read BOOLEAN DEFAULT 0,
-                has_attachments BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table de synchronisation
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS sync_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                sync_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                emails_fetched INTEGER DEFAULT 0,
-                emails_updated INTEGER DEFAULT 0,
-                last_email_date TEXT,
-                status TEXT DEFAULT 'success',
-                error_message TEXT
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"⚠️ Erreur création tables : {e}")
-        return False
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-
-# ── SESSION STATE ─────────────────────────────────────────────
-for k, v in [("token", None), ("device_flow", None), ("msal_app", None),
-             ("msal_cache", None), ("token_cache", None),
-             ("user_id", None), ("user_mail", None),
-             ("live_expanded", {}), ("live_results", None), ("live_query_done", "")]:
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ── CONFIG AUTH ───────────────────────────────────────────────
-def get_auth_config():
-    return {
-        "client_id": st.secrets["AZURE_CLIENT_ID"],
-        "tenant_id": st.secrets["AZURE_TENANT_ID"],
-        "scopes": ["Mail.Read", "Mail.ReadWrite", "User.Read"]
-    }
-
-# ── AUTH FUNCTIONS ────────────────────────────────────────────
-def init_auth(cfg):
-    cache = msal.SerializableTokenCache()
-    if st.session_state.token_cache:
-        cache.deserialize(st.session_state.token_cache)
-    app = msal.PublicClientApplication(
-        client_id=cfg["client_id"],
-        authority=f"https://login.microsoftonline.com/{cfg['tenant_id']}",
-        token_cache=cache
-    )
-    return app, cache
-
-def try_silent_auth(cfg):
-    app, cache = init_auth(cfg)
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(cfg["scopes"], account=accounts[0])
-        if result and "access_token" in result:
-            st.session_state.token_cache = cache.serialize()
-            return result["access_token"]
-    return None
-
-def start_device_flow(cfg):
-    app, cache = init_auth(cfg)
-    flow = app.initiate_device_flow(scopes=cfg["scopes"])
-    st.session_state.device_flow = flow
-    st.session_state.msal_app = app
-    st.session_state.msal_cache = cache
-    return flow
-
-def complete_device_flow():
-    app   = st.session_state.msal_app
-    flow  = st.session_state.device_flow
-    cache = st.session_state.msal_cache
-    if not app or not flow:
-        return None
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" in result:
-        st.session_state.token_cache = cache.serialize()
-        return result["access_token"]
-    return None
-
-# ── FONCTION POUR OBTENIR L'ID UTILISATEUR ───────────────────
-def get_user_info(token):
-    """Récupère l'ID et l'email unique de l'utilisateur"""
-    try:
-        me = graph_get(token, "/me")
-        user_id = me.get("id")
-        user_mail = me.get("mail") or me.get("userPrincipalName")
-        return user_id, user_mail
-    except:
-        return None, None
-
-def get_user_db_path(user_mail):
-    """Génère un chemin de DB unique par utilisateur"""
-    user_hash = hashlib.md5(user_mail.encode()).hexdigest()[:8]
-    base_dir = os.path.dirname(config.DB_PATH)
-    return os.path.join(base_dir, f"emails_{user_hash}.db")
-
-def get_user_index_path(user_mail):
-    """Génère un chemin d'index unique par utilisateur"""
-    user_hash = hashlib.md5(user_mail.encode()).hexdigest()[:8]
-    base_dir = os.path.dirname(config.INDEX_PATH)
-    return os.path.join(base_dir, f"index_{user_hash}")
-
-def get_sync_stats(user_db):
-    """Récupère les stats de la dernière synchronisation"""
-    try:
-        conn = sqlite3.connect(user_db)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT sync_time, emails_fetched, emails_updated, last_email_date 
-            FROM sync_log 
-            ORDER BY id DESC LIMIT 1
-        """)
-        result = cursor.fetchone()
-        conn.close()
-
-        if result:
-            return {
-                "sync_time": result[0],
-                "emails_fetched": result[1],
-                "emails_updated": result[2],
-                "last_email_date": result[3]
-            }
-    except:
-        pass
-    return None
-
-# ── PAGE LOGIN ────────────────────────────────────────────────
-def page_login(cfg):
-    st.title("📧 Email Search")
-    st.markdown("---")
-    _, col, _ = st.columns([1, 2, 1])
-    with col:
-        st.markdown("### Connexion Office 365")
-
-        token = try_silent_auth(cfg)
-        if token:
-            user_id, user_mail = get_user_info(token)
-            if user_id and user_mail:
-                st.session_state.token = token
-                st.session_state.user_id = user_id
-                st.session_state.user_mail = user_mail
-                st.rerun()
-
-        if not st.session_state.device_flow:
-            if st.button("Se connecter avec Office 365", use_container_width=True, type="primary"):
-                with st.spinner("Initialisation..."):
-                    start_device_flow(cfg)
-                st.rerun()
-        else:
-            flow = st.session_state.device_flow
-            code_match = re.search(r'enter the code ([A-Z0-9]+)', flow.get("message", ""))
-            code = code_match.group(1) if code_match else ""
-
-            st.info("**Etape 1** — Ouvrez : [https://microsoft.com/devicelogin](https://microsoft.com/devicelogin)")
-            st.info("**Etape 2** — Entrez ce code :")
-            st.code(code, language=None)
-            st.markdown("**Etape 3** — Connectez-vous puis cliquez :")
-
-            if st.button("J'ai entré le code, continuer", use_container_width=True, type="primary"):
-                with st.spinner("Vérification..."):
-                    token = complete_device_flow()
-                if token:
-                    user_id, user_mail = get_user_info(token)
-                    if user_id and user_mail:
-                        st.session_state.token = token
-                        st.session_state.user_id = user_id
-                        st.session_state.user_mail = user_mail
-                        st.session_state.device_flow = None
-                        st.rerun()
-                    else:
-                        st.error("Impossible de récupérer les infos utilisateur.")
-                else:
-                    st.error("Échec — réessayez.")
-                    st.session_state.device_flow = None
-
-# ── GRAPH HELPERS ─────────────────────────────────────────────
-def graph_get(token, endpoint):
-    r = requests.get(
-        f"{GRAPH_BASE}{endpoint}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30
-    )
-    r.raise_for_status()
-    return r.json()
-
-def graph_get_all_pages(token, endpoint):
-    results = []
-    url = f"{GRAPH_BASE}{endpoint}"
-    while url:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        results.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
-    return results
-
-# ── DOSSIERS ──────────────────────────────────────────────────
-FOLDER_OPTIONS = {
-    "📥 Boîte de réception":   "inbox",
-    "📤 Éléments envoyés":     "sentitems",
-    "🗑️ Éléments supprimés":  "deleteditems",
-    "📁 Tous les dossiers":    "all",
-    "📂 Courrier indésirable": "junkemail",
-    "📝 Brouillons":           "drafts",
+st.markdown("""
+<style>
+/* Cartes email */
+.email-card {
+    border: 1px solid #dde3ea;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin: 6px 0;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
 }
+.email-card:hover { box-shadow: 0 3px 10px rgba(0,0,0,.12); }
 
-def search_emails_api(token, query, folder_key):
-    select = "$select=subject,from,receivedDateTime,bodyPreview,isRead,toRecipients,body,id"
-    if folder_key == "all":
-        endpoint = f"/me/messages?$search=\"{query}\"&$top=999&{select}"
-    else:
-        endpoint = f"/me/mailFolders/{folder_key}/messages?$search=\"{query}\"&$top=999&{select}"
-    return graph_get_all_pages(token, endpoint)
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: .72em;
+    font-weight: 600;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+.badge-unread     { background:#e3f2fd; color:#1565c0; }
+.badge-attachment { background:#e8f5e9; color:#2e7d32; }
+.badge-high       { background:#ffebee; color:#b71c1c; }
+.badge-low        { background:#f3f3f3; color:#757575; }
 
-def highlight_keywords(text, keywords):
-    for kw in keywords:
-        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-        text = pattern.sub(lambda m: f"**:orange[{m.group(0)}]**", text)
-    return text
+/* Bouton Microsoft */
+.ms-btn {
+    display:block; width:100%; padding:12px 0; text-align:center;
+    background:#0078d4; color:#fff !important; border-radius:6px;
+    font-size:1em; font-weight:600; text-decoration:none;
+    transition:background .2s;
+}
+.ms-btn:hover { background:#106ebe; }
+</style>
+""", unsafe_allow_html=True)
 
-def highlight_keywords_html(text, keywords):
-    for kw in keywords:
-        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-        text = pattern.sub(
-            lambda m: f"<mark style='background:orange;color:black'>{m.group(0)}</mark>",
-            text
-        )
-    return text
 
-def email_matches(email, keywords):
-    subject  = (email.get("subject") or "").lower()
-    preview  = (email.get("bodyPreview") or "").lower()
-    body_raw = email.get("body", {})
-    body     = (body_raw.get("content") if isinstance(body_raw, dict) else "").lower()
-    sender   = (email.get("from", {}).get("emailAddress", {}).get("name") or "").lower()
-    sender  += (email.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
-    full_text = f"{subject} {preview} {body} {sender}"
-    return all(kw in full_text for kw in keywords)
+# ── Helpers auth ──────────────────────────────────────────────────────────────
 
-# ── VÉRIFICATION TOKEN ────────────────────────────────────────
-cfg = get_auth_config()
+def is_logged_in() -> bool:
+    return "user_info" in st.session_state and "token_cache" in st.session_state
 
-if not st.session_state.token or not st.session_state.user_mail:
-    page_login(cfg)
-    st.stop()
 
-token = st.session_state.token
-user_mail = st.session_state.user_mail
-user_db = get_user_db_path(user_mail)
-user_index = get_user_index_path(user_mail)
+def get_access_token() -> str | None:
+    """Retourne un access token valide, rafraîchi si nécessaire."""
+    if not is_logged_in():
+        return None
+    result, new_cache = acquire_token_silent(st.session_state["token_cache"])
+    if result and "access_token" in result:
+        st.session_state["token_cache"] = new_cache
+        return result["access_token"]
+    # Fallback : token stocké en session
+    return st.session_state.get("access_token")
 
-# ✅ CRÉER LES TABLES AU DÉMARRAGE
-create_tables(user_db)
 
-# ── SIDEBAR ───────────────────────────────────────────────────
-with st.sidebar:
-    st.title("📧 Email Search")
-    st.markdown("---")
+def handle_oauth_callback():
+    """Détecte le code OAuth dans l'URL et l'échange contre un token."""
+    params = st.query_params
+    if "code" not in params or is_logged_in():
+        return
+
+    code = params["code"]
     try:
-        me = graph_get(token, "/me")
-        st.success(f"👤 {me.get('displayName', 'Utilisateur')}")
-        st.caption(me.get('mail', ''))
-    except:
-        st.success("✅ Connecté")
-
-    if st.button("🚪 Déconnexion"):
-        for k in ["token", "token_cache", "device_flow", "user_id", "user_mail", 
-                  "live_expanded", "live_results", "live_query_done"]:
-            st.session_state[k] = None
-        st.rerun()
-
-    st.markdown("---")
-    menu = st.radio("Navigation", [
-        "🔍 Recherche",
-        "📊 Statistiques",
-        "🔄 Synchronisation",
-        "🔧 Debug"
-    ])
-    st.markdown("---")
-
-    # ── STATS EN SIDEBAR ──────────────────────────────────────
-    try:
-        conn  = sqlite3.connect(user_db)
-        count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
-        conn.close()
-        st.metric("📧 Emails indexés", f"{count:,}")
-
-        # Affiche la dernière synchro
-        sync_stats = get_sync_stats(user_db)
-        if sync_stats:
-            st.caption(f"📅 Dernière synchro : {sync_stats['sync_time'][:10]}")
-            st.caption(f"🆕 {sync_stats['emails_fetched']} récupérés")
-    except:
-        st.warning("⚠️ Base non initialisée")
-
-# ── PAGE RECHERCHE ────────────────────────────────────────────
-if menu == "🔍 Recherche":
-    st.title("🔍 Recherche d'emails")
-
-    tab_local, tab_live = st.tabs(["🗄️ Recherche locale (SQLite)", "☁️ Recherche live (API)"])
-
-    # ── RECHERCHE LOCALE ──────────────────────────────────────
-    with tab_local:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            query = st.text_input("Rechercher", placeholder="Ex: facture janvier...")
-        with col2:
-            search_in = st.multiselect(
-                "Chercher dans",
-                ["subject", "body", "sender"],
-                default=["subject", "body"]
-            )
-
-        with st.expander("🔧 Filtres avancés"):
-            col3, col4 = st.columns(2)
-            with col3:
-                date_debut = st.date_input("Date début", value=None, key="local_debut")
-            with col4:
-                date_fin   = st.date_input("Date fin",   value=None, key="local_fin")
-            sender_filter = st.text_input("Expéditeur")
-
-        if query:
-            try:
-                from src.search_engine import SearchEngine
-                engine   = SearchEngine(db_path=user_db, index_path=user_index)  # ✅ CORRIGÉ : ajout de index_path
-                keywords = [kw.strip() for kw in query.split() if kw.strip()]
-
-                all_sets        = []
-                all_results_map = {}
-                for keyword in keywords:
-                    res = engine.search(keyword)  # ✅ CORRIGÉ : suppression de fields=search_in
-                    all_sets.append(set(r['id'] for r in res))
-                    for r in res:
-                        all_results_map[r['id']] = r
-
-                common_ids = all_sets[0].intersection(*all_sets[1:]) if all_sets else set()
-                results    = [all_results_map[i] for i in common_ids]
-
-                if sender_filter:
-                    results = [r for r in results if
-                               sender_filter.lower() in r['sender'].lower() or
-                               sender_filter.lower() in r['sender_email'].lower()]
-                if date_debut:
-                    results = [r for r in results if r['date'][:10] >= str(date_debut)]
-                if date_fin:
-                    results = [r for r in results if r['date'][:10] <= str(date_fin)]
-
-                st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords)}")
-                st.markdown(f"**{len(results)} résultat(s) trouvé(s)**")
-                st.markdown("---")
-
-                for email in results:
-                    with st.expander(f"📧 {email['subject']} | 👤 {email['sender']} | 📅 {email['date'][:10]}"):
-                        st.markdown(f"**De :** {email['sender']} ({email['sender_email']})")
-                        to_raw = email.get('to', '')
-                        try:
-                            to_list    = json.loads(to_raw)
-                            to_display = ", ".join(
-                                f"{r['emailAddress']['name']} <{r['emailAddress']['address']}>"
-                                for r in to_list
-                            )
-                        except:
-                            to_display = to_raw or "N/A"
-                        st.markdown(f"**À :** {to_display}")
-                        st.markdown(f"**Date :** {email['date']}")
-                        st.markdown(f"**Aperçu :** {email['body_preview']}")
-                        st.markdown(f"**Score :** {email['score']:.2f}")
-                        if st.button("Voir email complet", key=email['id']):
-                            detail = engine.get_email_detail(email['id'])
-                            st.markdown("---")
-                            st.markdown(detail['body'], unsafe_allow_html=True)
-
-            except Exception as e:
-                st.error(f"❌ Erreur : {e}")
-                import traceback
-                st.error(traceback.format_exc())
-                st.info("💡 Lancez d'abord une synchronisation !")
-
-    # ── RECHERCHE LIVE API ────────────────────────────────────
-    with tab_live:
-        st.caption("💡 Entrez plusieurs mots séparés par des espaces : **tous** doivent être présents dans l'email.")
-
-        col1, col2, col3 = st.columns([3, 2, 1])
-        with col1:
-            live_query = st.text_input(
-                "Mots-clés",
-                placeholder="Ex: facture janvier dupont",
-                key="live_q"
-            )
-        with col2:
-            folder_label = st.selectbox("📂 Dossier", list(FOLDER_OPTIONS.keys()))
-        with col3:
-            st.markdown("<br>", unsafe_allow_html=True)
-            search_btn = st.button("Rechercher", type="primary", use_container_width=True)
-
-        # Lance la recherche et stocke les résultats en session
-        if search_btn and live_query:
-            folder_key    = FOLDER_OPTIONS[folder_label]
-            keywords_list = [kw.strip().lower() for kw in live_query.split() if kw.strip()]
-
-            with st.spinner(f"Recherche dans « {folder_label} »..."):
-                try:
-                    emails   = search_emails_api(token, live_query, folder_key)
-                    filtered = [e for e in emails if email_matches(e, keywords_list)]
-                    st.session_state.live_results      = filtered
-                    st.session_state.live_query_done   = live_query
-                    st.session_state.live_total_api    = len(emails)
-                    st.session_state.live_expanded      = {}   # reset les corps ouverts
-                except Exception as e:
-                    st.error(f"❌ Erreur : {e}")
-                    st.session_state.live_results = None
-
-        elif search_btn:
-            st.warning("Entrez au moins un mot-clé.")
-
-        # Affichage des résultats stockés
-        if st.session_state.live_results is not None:
-            filtered      = st.session_state.live_results
-            keywords_list = [kw.strip().lower() for kw in st.session_state.live_query_done.split() if kw.strip()]
-            total_api     = st.session_state.get("live_total_api", 0)
-
-            if not filtered:
-                st.info("Aucun email ne contient vraiment ces mots-clés.")
-                st.caption(f"(L'API avait retourné {total_api} résultats, tous écartés)")
-            else:
-                st.success(f"✅ {len(filtered)} email(s) trouvé(s)")
-                if len(filtered) < total_api:
-                    st.caption(
-                        f"ℹ️ {total_api - len(filtered)} email(s) écartés car "
-                        f"les mots-clés n'y apparaissaient pas réellement."
-                    )
-                if keywords_list:
-                    st.markdown(f"🔑 **Mots clés :** {' | '.join(f'`{kw}`' for kw in keywords_list)}")
-                st.markdown("---")
-
-                for idx, email in enumerate(filtered):
-                    email_id    = email.get("id", str(idx))
-                    subject     = email.get("subject", "(sans objet)")
-                    sender      = email.get("from", {}).get("emailAddress", {})
-                    sender_name = sender.get("name", "")
-                    sender_addr = sender.get("address", "")
-                    date        = email.get("receivedDateTime", "")[:10]
-                    preview     = email.get("bodyPreview", "")
-                    is_read     = email.get("isRead", True)
-                    unread      = "🔵 " if not is_read else ""
-                    to_list     = email.get("toRecipients", [])
-                    to_str      = ", ".join([
-                        r.get("emailAddress", {}).get("address", "")
-                        for r in to_list
-                    ])
-                    preview_hl  = highlight_keywords(preview, keywords_list)
-
-                    with st.expander(f"{unread}📧 **{subject}** — {sender_name} ({date})"):
-                        st.markdown(f"**De :** {sender_name} <{sender_addr}>")
-                        if to_str:
-                            st.markdown(f"**À :** {to_str}")
-                        st.markdown(f"**Date :** {date}")
-                        st.markdown(f"**Aperçu :** {preview_hl}")
-
-                        # Bouton "Voir email complet" — stocke l'état dans session_state
-                        btn_key = f"live_open_{email_id}"
-                        if st.session_state.live_expanded.get(email_id):
-                            body_raw     = email.get("body", {})
-                            body_content = body_raw.get("content", "") if isinstance(body_raw, dict) else ""
-                            body_hl      = highlight_keywords_html(body_content, keywords_list)
-                            st.markdown("---")
-                            st.components.v1.html(body_hl, height=500, scrolling=True)
-                            if st.button("🔼 Masquer", key=f"hide_{email_id}"):
-                                st.session_state.live_expanded[email_id] = False
-                                st.rerun()
-                        else:
-                            if st.button("📄 Voir email complet", key=btn_key):
-                                st.session_state.live_expanded[email_id] = True
-                                st.rerun()
-
-# ── PAGE STATISTIQUES ─────────────────────────────────────────
-elif menu == "📊 Statistiques":
-    st.title("📊 Statistiques")
-    try:
-        conn = sqlite3.connect(user_db)
-        df   = pd.read_sql_query(
-            "SELECT sender, sender_email, date, is_read, has_attachments FROM emails", conn
-        )
-        conn.close()
-
-        if len(df) == 0:
-            st.warning("⚠️ Aucun email indexé. Lancez une synchronisation d'abord.")
-        else:
-            df["date"] = pd.to_datetime(df["date"])
-            df["mois"] = df["date"].dt.to_period("M").astype(str)
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total emails",        len(df))
-            col2.metric("Emails non lus",      len(df[df["is_read"] == 0]))
-            col3.metric("Avec pièces jointes", len(df[df["has_attachments"] == 1]))
-            st.markdown("---")
-
-            fig1 = px.bar(df.groupby("mois").size().reset_index(name="count"),
-                          x="mois", y="count", title="📅 Emails reçus par mois")
-            st.plotly_chart(fig1, use_container_width=True)
-
-            top_senders = (df.groupby("sender_email").size()
-                           .reset_index(name="count")
-                           .sort_values("count", ascending=False)
-                           .head(10))
-            fig2 = px.bar(top_senders, x="count", y="sender_email",
-                          orientation="h", title="👥 Top 10 expéditeurs")
-            st.plotly_chart(fig2, use_container_width=True)
-
+        result, cache = acquire_token_by_code(code)
     except Exception as e:
-        st.error(f"❌ Erreur : {e}")
-        import traceback
-        st.error(traceback.format_exc())
+        st.error(f"Erreur lors de la connexion : {e}")
+        st.query_params.clear()
+        return
 
-# ── PAGE SYNCHRONISATION ──────────────────────────────────────
-elif menu == "🔄 Synchronisation":
-    st.title("🔄 Synchronisation des emails")
+    if "access_token" not in result:
+        st.error(f"Échec OAuth : {result.get('error_description', 'Erreur inconnue')}")
+        st.query_params.clear()
+        return
 
-    # ── STATS ACTUELLES ──────────────────────────────────────
-    sync_stats = get_sync_stats(user_db)
-    if sync_stats:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("📅 Dernière synchro", sync_stats['sync_time'][:10])
-        col2.metric("📬 Emails récupérés", sync_stats['emails_fetched'])
-        col3.metric("🆕 Nouveaux/modifiés", sync_stats['emails_updated'])
+    user_info = get_user_info(result["access_token"])
+    if not user_info:
+        st.error("Impossible de récupérer les informations utilisateur.")
+        st.query_params.clear()
+        return
+
+    st.session_state["token_cache"]  = cache
+    st.session_state["access_token"] = result["access_token"]
+    st.session_state["user_info"]    = user_info
+    st.query_params.clear()
+    st.rerun()
+
+
+# ── Page de connexion ─────────────────────────────────────────────────────────
+
+def page_login():
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("## 📧 Email Search")
+        st.markdown("---")
+        st.markdown("### Connexion requise")
+        st.markdown(
+            "Connectez-vous avec votre compte **Microsoft Office 365** "
+            "pour accéder à la recherche dans vos emails."
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        auth_url = get_auth_url()
+        st.markdown(
+            f'<a href="{auth_url}" target="_self" class="ms-btn">'
+            f'🔐 &nbsp; Se connecter avec Microsoft</a>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.caption(
+            "🔒 Seuls les comptes du tenant Microsoft configuré peuvent accéder à cette application. "
+            "Chaque utilisateur dispose de sa propre base de données isolée."
+        )
+
+
+# ── Formatage ─────────────────────────────────────────────────────────────────
+
+def fmt_date(dt_str: str) -> str:
+    if not dt_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return dt_str
+
+
+def highlight_keywords(text: str, keywords: list[str]) -> str:
+    """Met en gras les mots-clés dans un texte (HTML simple)."""
+    import html
+    safe = html.escape(text)
+    for kw in keywords:
+        if kw:
+            import re
+            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+            safe = pattern.sub(
+                lambda m: f"<mark style='background:#fff176;border-radius:3px'>{m.group()}</mark>",
+                safe,
+            )
+    return safe
+
+
+# ── Synchronisation ───────────────────────────────────────────────────────────
+
+def run_sync(access_token: str, user_id: str):
+    """Lance la synchronisation et affiche la progression."""
+    st.markdown("### 🔄 Synchronisation en cours…")
+    status_ph = st.empty()
+    counter_ph = st.empty()
+    progress_bar = st.progress(0.0)
+
+    indexer = EmailIndexer(access_token, user_id)
+
+    def on_status(msg: str, count: int):
+        status_ph.info(f"📬 {msg}")
+        counter_ph.metric("Emails indexés", f"{count:,}")
+
+    try:
+        total = indexer.full_sync(on_status=on_status)
+        progress_bar.progress(1.0)
+        st.success(f"✅ Synchronisation terminée — **{total:,}** emails indexés / mis à jour.")
+        st.session_state.pop("show_sync", None)
+        st.rerun()
+    except PermissionError as e:
+        st.error(str(e))
+        # Force re-login
+        for k in ["user_info", "token_cache", "access_token"]:
+            st.session_state.pop(k, None)
+    except Exception as e:
+        st.error(f"Erreur de synchronisation : {e}")
+        st.session_state.pop("show_sync", None)
+
+
+# ── Résultats de recherche ────────────────────────────────────────────────────
+
+PAGE_SIZE = 25
+
+
+def show_results(
+    db: Database,
+    keywords: list[str],
+    folder_filter: str,
+    folder_ids: list[str] | None,
+    tab_key: str,
+):
+    """Affiche les résultats paginés avec mise en évidence des mots-clés."""
+    page_key = f"page_{tab_key}"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+
+    page = st.session_state[page_key]
+
+    if not keywords:
+        st.info("ℹ️ Entrez au moins un mot-clé pour lancer la recherche.")
+        return
+
+    with st.spinner("Recherche en cours…"):
+        results, total = db.search_emails(
+            keywords=keywords,
+            folder_filter=folder_filter,
+            folder_ids=folder_ids,
+            limit=PAGE_SIZE,
+            offset=page * PAGE_SIZE,
+        )
+
+    if total == 0:
+        st.warning(
+            f"Aucun résultat pour : **{' + '.join(keywords)}**\n\n"
+            "Tous les mots-clés doivent être présents dans l'email."
+        )
+        return
+
+    total_pages = max(1, (total - 1) // PAGE_SIZE + 1)
+    st.markdown(
+        f"**{total:,} résultat(s)** — mots-clés : "
+        + " &nbsp;`ET`&nbsp; ".join(f"`{k}`" for k in keywords)
+        + f" &nbsp;|&nbsp; page **{page+1}** / {total_pages}",
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
+    for email in results:
+        badges = ""
+        if not email["is_read"]:
+            badges += '<span class="badge badge-unread">Non lu</span>'
+        if email["has_attachments"]:
+            badges += '<span class="badge badge-attachment">📎 PJ</span>'
+        if email["importance"] == "high":
+            badges += '<span class="badge badge-high">🔴 Urgent</span>'
+
+        subject_hl = highlight_keywords(email["subject"] or "(Sans objet)", keywords)
+        preview_hl = highlight_keywords(email["body_preview"] or "", keywords)
+
+        with st.expander(
+            f"{'🔵 ' if not email['is_read'] else '⚪ '}"
+            f"{email['subject'] or '(Sans objet)'} "
+            f"— {email['sender_name'] or email['sender_email']} "
+            f"— {fmt_date(email['received_datetime'])}",
+            expanded=False,
+        ):
+            c1, c2 = st.columns([4, 1])
+
+            with c1:
+                st.markdown(
+                    f"{badges}<br>"
+                    f"<b>Objet :</b> {subject_hl}<br>"
+                    f"<b>De :</b> {email['sender_name']} &lt;{email['sender_email']}&gt;<br>"
+                    f"<b>À :</b> {(email['recipients'] or '—')[:300]}<br>"
+                    f"<b>Dossier :</b> 📁 {email['folder_name']}&nbsp;&nbsp;"
+                    f"<b>Date :</b> {fmt_date(email['received_datetime'])}",
+                    unsafe_allow_html=True,
+                )
+
+            with c2:
+                if email.get("web_link"):
+                    st.markdown(
+                        f'<a href="{email["web_link"]}" target="_blank">'
+                        f'<button style="background:#0078d4;color:#fff;border:none;'
+                        f'padding:8px 14px;border-radius:6px;cursor:pointer;width:100%;font-size:.9em">'
+                        f'📬 Ouvrir Outlook</button></a>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown("---")
+            st.markdown(
+                f"<div style='color:#333;line-height:1.6'>{preview_hl}</div>",
+                unsafe_allow_html=True,
+            )
+
+            if st.button("📄 Voir le contenu complet", key=f"full_{tab_key}_{email['id']}"):
+                full = db.get_email_detail(email["id"])
+                if full and full.get("body"):
+                    st.text_area(
+                        "Contenu complet",
+                        full["body"],
+                        height=350,
+                        key=f"body_{tab_key}_{email['id']}",
+                    )
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    if total_pages > 1:
+        st.markdown("---")
+        pc1, pc2, pc3 = st.columns([1, 4, 1])
+        with pc1:
+            if page > 0 and st.button("← Précédent", key=f"prev_{tab_key}"):
+                st.session_state[page_key] -= 1
+                st.rerun()
+        with pc2:
+            st.markdown(
+                f"<p style='text-align:center;margin:8px 0'>Page <b>{page+1}</b> / {total_pages}</p>",
+                unsafe_allow_html=True,
+            )
+        with pc3:
+            if page < total_pages - 1 and st.button("Suivant →", key=f"next_{tab_key}"):
+                st.session_state[page_key] += 1
+                st.rerun()
+
+
+# ── Page principale ───────────────────────────────────────────────────────────
+
+def page_main():
+    user_info = st.session_state["user_info"]
+    user_id   = user_info.get("id") or user_info.get("mail") or "unknown"
+
+    db      = Database(user_id)
+    stats   = db.get_stats()
+    folders = db.get_folders()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown(f"### 👤 {user_info.get('displayName', 'Utilisateur')}")
+        st.caption(user_info.get("mail") or user_info.get("userPrincipalName", ""))
         st.markdown("---")
 
-    col1, col2 = st.columns([3, 1])
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("Emails", f"{stats['total_emails']:,}")
+        with col_b:
+            st.metric("Dossiers", stats["total_folders"])
 
-    with col1:
-        st.info("✅ La synchronisation est **incrémentale** — elle récupère uniquement les nouveaux emails depuis la dernière synchro.")
+        if stats.get("last_sync"):
+            try:
+                dt = datetime.fromisoformat(stats["last_sync"])
+                st.caption(f"🔄 Dernière sync : {dt.strftime('%d/%m/%Y %H:%M')}")
+            except Exception:
+                pass
 
-    with col2:
-        full_sync = st.checkbox("🔄 Forcer une synchro complète", value=False, 
-                                help="⚠️ Réanalyser TOUS les emails (lent)")
+        st.markdown("---")
 
-    if st.button("🚀 Lancer la synchronisation", type="primary", use_container_width=True):
-        try:
-            from src.email_fetcher import EmailFetcher
-            from src.indexer import EmailIndexer
+        if st.button("🔄 Synchroniser les emails", use_container_width=True, type="primary"):
+            st.session_state["show_sync"] = True
+            st.rerun()
 
-            # ✅ 1️⃣ Récupérer les emails (incrémental par défaut)
-            with st.spinner("📥 Récupération des emails..."):
-                fetcher = EmailFetcher(token=token, db_path=user_db, user_email=user_mail)
-                total_fetched = fetcher.fetch_all_emails(incremental=not full_sync)
+        # Stats par dossier (sidebar déroulante)
+        with st.expander("📊 Emails par dossier"):
+            for row in stats["by_folder"][:15]:
+                st.markdown(f"**{row['folder_name']}** : {row['cnt']:,}")
 
-                if total_fetched > 0:
-                    st.success(f"✅ {total_fetched} emails récupérés !")
-                else:
-                    st.info("ℹ️ Aucun nouvel email depuis la dernière synchronisation.")
+        st.markdown("---")
+        if st.button("🚪 Se déconnecter", use_container_width=True):
+            for k in ["user_info", "token_cache", "access_token", "show_sync"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
-            # ✅ 2️⃣ Indexer les emails (incrémental par défaut)
-            if total_fetched > 0:
-                with st.spinner("🔍 Indexation en cours..."):
-                    indexer = EmailIndexer(db_path=user_db, index_path=user_index)
-                    total_indexed = indexer.index_all_emails(incremental=not full_sync)
-                    st.success(f"✅ {total_indexed} emails indexés !")
+    # ── Sync panel ────────────────────────────────────────────────────────────
+    if st.session_state.get("show_sync"):
+        token = get_access_token()
+        if token:
+            run_sync(token, user_id)
+        else:
+            st.error("Session expirée, veuillez vous reconnecter.")
+            st.session_state.pop("show_sync", None)
+        return  # Ne pas afficher le reste pendant la sync
 
-                st.balloons()
+    # ── En-tête + barre de recherche ──────────────────────────────────────────
+    st.markdown("# 📧 Recherche d'emails")
 
-            # ✅ Afficher les stats mises à jour
-            st.markdown("---")
-            st.subheader("📊 Résumé de la synchronisation")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("📧 Total indexé", total_fetched)
-            with col2:
-                conn = sqlite3.connect(user_db)
-                total_count = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
-                conn.close()
-                st.metric("📬 Emails en base", f"{total_count:,}")
+    with st.form("search_form"):
+        kw_input = st.text_input(
+            "🔍 Mots-clés (séparés par des virgules)",
+            placeholder="Ex: réunion, budget, 2024",
+            help="Logique ET : tous les mots-clés doivent être présents dans l'email.",
+        )
+        submitted = st.form_submit_button("Rechercher", type="primary", use_container_width=True)
 
-        except Exception as e:
-            st.error(f"❌ Erreur : {e}")
-            import traceback
-            st.error(traceback.format_exc())
+    keywords: list[str] = []
+    if kw_input:
+        keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
 
-# ── PAGE DEBUG ────────────────────────────────────────────────
-elif menu == "🔧 Debug":
-    st.title("🔧 Test connexion API")
+    if submitted and not keywords:
+        st.warning("Veuillez entrer au moins un mot-clé.")
 
-    if st.button("Tester la connexion"):
-        try:
-            me = graph_get(token, "/me")
-            st.success("✅ Token valide !")
-            st.json(me)
+    # ── Onglets filtres dossiers ──────────────────────────────────────────────
+    tab_all, tab_no_sent, tab_specific = st.tabs([
+        "📬 Toute la boîte mail",
+        "📥 Hors Envoyés / Supprimés",
+        "📁 Dossier spécifique",
+    ])
 
-            st.markdown("---")
-            st.markdown("**Test récupération emails (5 premiers) :**")
-            emails = graph_get(token, "/me/messages?$top=5&$select=subject,receivedDateTime,from")
-            st.json(emails)
+    with tab_all:
+        if submitted:
+            show_results(db, keywords, "all", None, "all")
+        elif not submitted and "search_kw" in st.session_state:
+            show_results(db, st.session_state["search_kw"], "all", None, "all")
 
-        except Exception as e:
-            st.error(f"❌ Exception : {e}")
+    with tab_no_sent:
+        if submitted:
+            show_results(db, keywords, "no_sent_deleted", None, "no_sent")
+        elif not submitted and "search_kw" in st.session_state:
+            show_results(db, st.session_state["search_kw"], "no_sent_deleted", None, "no_sent")
 
-    st.markdown("---")
-    st.subheader("🗄️ Infos Base de données")
-    try:
-        conn = sqlite3.connect(user_db)
-        cursor = conn.cursor()
+    with tab_specific:
+        if not folders:
+            st.info("Aucun dossier indexé. Lancez une synchronisation d'abord.")
+        else:
+            folder_map = {
+                f["display_path"]: f["id"]
+                for f in sorted(folders, key=lambda x: x["display_path"])
+            }
+            selected = st.selectbox(
+                "Choisir un dossier",
+                options=list(folder_map.keys()),
+                key="folder_select",
+            )
+            folder_id = folder_map.get(selected)
 
-        cursor.execute("SELECT COUNT(*) FROM emails")
-        email_count = cursor.fetchone()[0]
+            if submitted and folder_id:
+                show_results(db, keywords, "specific", [folder_id], "specific")
+            elif not submitted and "search_kw" in st.session_state and folder_id:
+                show_results(
+                    db, st.session_state["search_kw"], "specific", [folder_id], "specific"
+                )
 
-        cursor.execute("SELECT COUNT(*) FROM sync_log")
-        sync_count = cursor.fetchone()[0]
+    # Mémorise les derniers mots-clés pour conserver l'affichage lors des paginations
+    if submitted and keywords:
+        st.session_state["search_kw"] = keywords
 
-        conn.close()
 
-        col1, col2 = st.columns(2)
-        col1.metric("📧 Emails en base", email_count)
-        col2.metric("📅 Synchronisations", sync_count)
+# ── Point d'entrée ────────────────────────────────────────────────────────────
 
-    except Exception as e:
-        st.error(f"❌ Erreur : {e}")
-        import traceback
-        st.error(traceback.format_exc())
+def main():
+    handle_oauth_callback()
 
-# ===== DEBUG SECTION =====
+    if is_logged_in():
+        page_main()
+    else:
+        page_login()
 
-st.markdown("---")
-st.markdown("### 🔧 DEBUG")
 
-if st.checkbox("🔍 Voir l'état de la BD"):
-
-    try:
-        conn = sqlite3.connect(user_db)
-        cursor = conn.cursor()
-
-        # Voir TOUTES les tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-
-        st.write("**Tables existantes en BD :**")
-        st.json([t[0] for t in tables])
-
-        # Si des tables existent, montre leur contenu
-        if tables:
-            for table_name in tables:
-                st.write(f"\n**Table: {table_name[0]}**")
-                cursor.execute(f"SELECT COUNT(*) FROM {table_name[0]}")
-                count = cursor.fetchone()[0]
-                st.write(f"Nombre de lignes : {count}")
-
-                # Affiche un aperçu
-                if count > 0:
-                    cursor.execute(f"SELECT * FROM {table_name[0]} LIMIT 3")
-                    columns = [description[0] for description in cursor.description]
-                    st.write(f"Colonnes : {columns}")
-
-        conn.close()
-
-    except Exception as e:
-        st.error(f"Erreur BD : {e}")
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,23 @@
+# Environnement
 .env
-.streamlit/secrets.toml
-data/
+.venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Bases de données utilisateurs (contiennent des emails privés)
+data/
+*.db
+*.sqlite
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
