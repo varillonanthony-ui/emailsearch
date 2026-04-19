@@ -191,15 +191,19 @@ def run_sync(access_token: str, user_id: str, force_full: bool = False):
 
     if not force_full:
         st.info(
-            "⚡ **Mode incrémental** — seuls les emails **nouveaux, modifiés ou supprimés** "
-            "depuis la dernière sync sont traités. Les dossiers déjà indexés sans changement "
-            "sont sautés instantanément."
+            "⚡ **Mode incrémental** — seuls les emails nouveaux, modifiés ou supprimés "
+            "depuis la dernière sync sont traités. Dossiers déjà à jour → sautés instantanément."
         )
     else:
         st.warning(
-            "🔁 **Mode complet** — tous les delta tokens sont réinitialisés. "
-            "Toute la boîte sera re-téléchargée. Cela peut prendre plusieurs minutes."
+            "🔁 **Mode complet** — tous les curseurs sont réinitialisés. "
+            "Toute la boîte sera re-téléchargée."
         )
+    st.caption(
+        "💡 La sync télécharge les métadonnées + aperçu (255 car.) — "
+        "pas le corps complet. Cela permet d'indexer 10 000 emails en quelques minutes. "
+        "Le corps complet est chargé à la demande quand vous cliquez 'Contenu complet'."
+    )
 
     status_ph = st.empty()
     cols      = st.columns(4)
@@ -340,9 +344,23 @@ def show_results(db, keywords, folder_filter, folder_ids, tab_key):
 
             if st.button("📄 Contenu complet", key=f"full_{tab_key}_{email['id']}"):
                 full = db.get_email_detail(email["id"])
-                if full and full.get("body"):
-                    st.text_area("Corps complet", full["body"], height=350,
+                body = full.get("body", "") if full else ""
+                if not body:
+                    # Corps non stocké lors de la sync bulk → chargement à la demande
+                    token = get_access_token()
+                    if token:
+                        with st.spinner("Chargement du corps…"):
+                            from email_indexer import EmailIndexer as _EI
+                            body = _EI(token, user_id).get_email_body(email["id"])
+                            if body and full:
+                                # Mise en cache en base pour les prochaines fois
+                                full["body"] = body
+                                db.upsert_email(full)
+                if body:
+                    st.text_area("Corps complet", body, height=350,
                                  key=f"body_{tab_key}_{email['id']}")
+                else:
+                    st.info("Corps non disponible. Ouvrez l'email dans Outlook.")
 
     if total_pages > 1:
         st.markdown("---")
