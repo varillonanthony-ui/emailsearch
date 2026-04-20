@@ -1,16 +1,25 @@
 """
-auth.py – Authentification Microsoft via Device Code Flow.
-Aucun redirect URI requis — fonctionne dans les iframes Streamlit Cloud.
+auth.py – Authentification Microsoft via Device Code Flow multi-tenant.
+
+Configuration Azure AD requise :
+  - App Registration → Authentification → Types de comptes pris en charge
+    → "Comptes dans un annuaire organisationnel (tout Azure AD — multi-tenant)"
+  - Secrets Streamlit : AZURE_CLIENT_ID + APP_PASSWORD (plus besoin de AZURE_TENANT_ID)
+
+L'endpoint "organizations" accepte n'importe quel tenant Microsoft 365,
+ce qui permet de connecter plusieurs boîtes de domaines différents.
 """
 
 import requests
 
-SCOPES = "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access"
+SCOPES   = "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read offline_access"
+ENDPOINT = "https://login.microsoftonline.com/organizations/oauth2/v2.0"
 
 
-def start_device_flow(tenant_id: str, client_id: str) -> dict:
+def start_device_flow(client_id: str) -> dict:
+    """Démarre le device code flow (multi-tenant, accepte tout domaine M365)."""
     r = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode",
+        f"{ENDPOINT}/devicecode",
         data={"client_id": client_id, "scope": SCOPES},
         timeout=15,
     )
@@ -18,9 +27,10 @@ def start_device_flow(tenant_id: str, client_id: str) -> dict:
     return r.json()
 
 
-def poll_token(tenant_id: str, client_id: str, device_code: str) -> tuple[str | None, str | None]:
+def poll_token(client_id: str, device_code: str) -> tuple[str | None, str | None]:
+    """Interroge le token endpoint. Retourne (access_token, refresh_token)."""
     r = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        f"{ENDPOINT}/token",
         data={
             "client_id":   client_id,
             "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
@@ -32,9 +42,10 @@ def poll_token(tenant_id: str, client_id: str, device_code: str) -> tuple[str | 
     return d.get("access_token"), d.get("refresh_token")
 
 
-def refresh_access_token(tenant_id: str, client_id: str, refresh_token: str) -> str | None:
+def refresh_access_token(client_id: str, refresh_token: str) -> str | None:
+    """Rafraîchit silencieusement un access token."""
     r = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        f"{ENDPOINT}/token",
         data={
             "client_id":     client_id,
             "grant_type":    "refresh_token",
@@ -47,6 +58,7 @@ def refresh_access_token(tenant_id: str, client_id: str, refresh_token: str) -> 
 
 
 def get_user_info(access_token: str) -> dict | None:
+    """Récupère le profil Microsoft Graph (/me)."""
     r = requests.get(
         "https://graph.microsoft.com/v1.0/me",
         headers={"Authorization": f"Bearer {access_token}"},
