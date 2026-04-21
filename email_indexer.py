@@ -25,11 +25,16 @@ import requests
 from database import Database
 
 GRAPH      = "https://graph.microsoft.com/v1.0"
-PAGE_SIZE  = 1000   # maximum autorisé par Graph pour /messages
+# Avec le corps texte inclus, on réduit la taille de page pour éviter les timeouts.
+# 50 messages × ~5 Ko de corps texte = ~250 Ko par requête, très raisonnable.
+PAGE_SIZE  = 50
 
+# body inclus dans la sync bulk (format texte brut, ~2-5 Ko/email)
+# Indispensable pour trouver les mots-clés dans le corps complet.
+# Le format HTML est exclu ($top=1000 resterait dans les limites)
 MSG_SELECT = (
     "id,subject,from,sender,toRecipients,ccRecipients,"
-    "bodyPreview,receivedDateTime,sentDateTime,"
+    "bodyPreview,body,receivedDateTime,sentDateTime,"
     "hasAttachments,isRead,importance,conversationId,webLink"
 )
 
@@ -70,7 +75,11 @@ class EmailIndexer:
 
     def __init__(self, access_token: str, user_id: str):
         self.db = Database(user_id)
-        self._headers = {"Authorization": f"Bearer {access_token}"}
+        self._headers = {
+            "Authorization": f"Bearer {access_token}",
+            # Demande le corps en texte brut (3-10x plus léger que HTML)
+            "Prefer": 'outlook.body-content-type="text"',
+        }
 
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
@@ -250,7 +259,7 @@ class EmailIndexer:
             "recipients":        _clean(_addrs("toRecipients")),
             "cc":                _clean(_addrs("ccRecipients")),
             "body_preview":      _clean(msg.get("bodyPreview", "")),
-            "body":              "",   # chargé à la demande
+            "body":              _clean((msg.get("body") or {}).get("content", "")),
             "received_datetime": msg.get("receivedDateTime", ""),
             "sent_datetime":     msg.get("sentDateTime", ""),
             "has_attachments":   1 if msg.get("hasAttachments") else 0,
